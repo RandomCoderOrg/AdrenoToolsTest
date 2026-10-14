@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "panvk_compute_spv.h"
+#include "panvk_sample_frag_spv.h"
+#include "panvk_sample_vert_spv.h"
 #include "panvk_triangle_frag_spv.h"
 #include "panvk_triangle_vert_spv.h"
 
@@ -120,6 +122,21 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkShaderModule compute_shader{};
    VkPipelineLayout compute_pipeline_layout{};
    VkPipeline compute_pipeline{};
+   VkImage sampled_image{};
+   VkDeviceMemory sampled_image_memory{};
+   VkImage output_image{};
+   VkDeviceMemory output_image_memory{};
+   VkImageView sampled_image_view{};
+   VkImageView output_image_view{};
+   VkSampler sampler{};
+   VkDescriptorSetLayout sample_descriptor_layout{};
+   VkDescriptorPool sample_descriptor_pool{};
+   VkShaderModule sample_vertex_shader{};
+   VkShaderModule sample_fragment_shader{};
+   VkPipelineLayout sample_pipeline_layout{};
+   VkRenderPass sample_render_pass{};
+   VkPipeline sample_pipeline{};
+   VkFramebuffer sample_framebuffer{};
    void *src_map{};
    void *dst_map{};
 
@@ -151,13 +168,16 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
                  GetPhysicalDeviceQueueFamilyProperties);
    INSTANCE_PROC(PFN_vkGetPhysicalDeviceMemoryProperties,
                  GetPhysicalDeviceMemoryProperties);
+   INSTANCE_PROC(PFN_vkGetPhysicalDeviceImageFormatProperties,
+                 GetPhysicalDeviceImageFormatProperties);
    INSTANCE_PROC(PFN_vkCreateDevice, CreateDevice);
    INSTANCE_PROC(PFN_vkGetDeviceProcAddr, GetDeviceProcAddr);
 #undef INSTANCE_PROC
 
    if (!DestroyInstance || !EnumeratePhysicalDevices ||
        !GetPhysicalDeviceQueueFamilyProperties ||
-       !GetPhysicalDeviceMemoryProperties || !CreateDevice ||
+       !GetPhysicalDeviceMemoryProperties ||
+       !GetPhysicalDeviceImageFormatProperties || !CreateDevice ||
        !GetDeviceProcAddr) {
       LOGE("buffer-copy[%s]: instance entrypoints unavailable", label);
       if (DestroyInstance)
@@ -186,13 +206,15 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    uint32_t queue_family = UINT32_MAX;
    for (uint32_t i = 0; i < family_count; ++i) {
       if (families[i].queueCount &&
-          (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+          (families[i].queueFlags &
+           (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+             (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
          queue_family = i;
          break;
       }
    }
    if (queue_family == UINT32_MAX) {
-      LOGE("buffer-copy[%s]: no compute-capable queue", label);
+      LOGI("buffer-copy[%s]: SKIP unsupported graphics+compute queue", label);
       DestroyInstance(instance, nullptr);
       return false;
    }
@@ -231,6 +253,16 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkAllocateCommandBuffers, AllocateCommandBuffers);
    DEVICE_PROC(PFN_vkBeginCommandBuffer, BeginCommandBuffer);
    DEVICE_PROC(PFN_vkCmdCopyBuffer, CmdCopyBuffer);
+   DEVICE_PROC(PFN_vkCreateImage, CreateImage);
+   DEVICE_PROC(PFN_vkDestroyImage, DestroyImage);
+   DEVICE_PROC(PFN_vkGetImageMemoryRequirements, GetImageMemoryRequirements);
+   DEVICE_PROC(PFN_vkBindImageMemory, BindImageMemory);
+   DEVICE_PROC(PFN_vkCmdCopyBufferToImage, CmdCopyBufferToImage);
+   DEVICE_PROC(PFN_vkCmdCopyImageToBuffer, CmdCopyImageToBuffer);
+   DEVICE_PROC(PFN_vkCreateImageView, CreateImageView);
+   DEVICE_PROC(PFN_vkDestroyImageView, DestroyImageView);
+   DEVICE_PROC(PFN_vkCreateSampler, CreateSampler);
+   DEVICE_PROC(PFN_vkDestroySampler, DestroySampler);
    DEVICE_PROC(PFN_vkCreateDescriptorSetLayout, CreateDescriptorSetLayout);
    DEVICE_PROC(PFN_vkDestroyDescriptorSetLayout, DestroyDescriptorSetLayout);
    DEVICE_PROC(PFN_vkCreateDescriptorPool, CreateDescriptorPool);
@@ -242,10 +274,18 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkCreatePipelineLayout, CreatePipelineLayout);
    DEVICE_PROC(PFN_vkDestroyPipelineLayout, DestroyPipelineLayout);
    DEVICE_PROC(PFN_vkCreateComputePipelines, CreateComputePipelines);
+   DEVICE_PROC(PFN_vkCreateGraphicsPipelines, CreateGraphicsPipelines);
    DEVICE_PROC(PFN_vkDestroyPipeline, DestroyPipeline);
    DEVICE_PROC(PFN_vkCmdBindPipeline, CmdBindPipeline);
    DEVICE_PROC(PFN_vkCmdBindDescriptorSets, CmdBindDescriptorSets);
    DEVICE_PROC(PFN_vkCmdDispatch, CmdDispatch);
+   DEVICE_PROC(PFN_vkCreateRenderPass, CreateRenderPass);
+   DEVICE_PROC(PFN_vkDestroyRenderPass, DestroyRenderPass);
+   DEVICE_PROC(PFN_vkCreateFramebuffer, CreateFramebuffer);
+   DEVICE_PROC(PFN_vkDestroyFramebuffer, DestroyFramebuffer);
+   DEVICE_PROC(PFN_vkCmdBeginRenderPass, CmdBeginRenderPass);
+   DEVICE_PROC(PFN_vkCmdEndRenderPass, CmdEndRenderPass);
+   DEVICE_PROC(PFN_vkCmdDraw, CmdDraw);
    DEVICE_PROC(PFN_vkCmdPipelineBarrier, CmdPipelineBarrier);
    DEVICE_PROC(PFN_vkEndCommandBuffer, EndCommandBuffer);
    DEVICE_PROC(PFN_vkQueueSubmit, QueueSubmit);
@@ -260,6 +300,36 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          UnmapMemory(device, src_memory);
       if (dst_map && UnmapMemory)
          UnmapMemory(device, dst_memory);
+      if (sample_framebuffer && DestroyFramebuffer)
+         DestroyFramebuffer(device, sample_framebuffer, nullptr);
+      if (sample_pipeline && DestroyPipeline)
+         DestroyPipeline(device, sample_pipeline, nullptr);
+      if (sample_render_pass && DestroyRenderPass)
+         DestroyRenderPass(device, sample_render_pass, nullptr);
+      if (sample_pipeline_layout && DestroyPipelineLayout)
+         DestroyPipelineLayout(device, sample_pipeline_layout, nullptr);
+      if (sample_vertex_shader && DestroyShaderModule)
+         DestroyShaderModule(device, sample_vertex_shader, nullptr);
+      if (sample_fragment_shader && DestroyShaderModule)
+         DestroyShaderModule(device, sample_fragment_shader, nullptr);
+      if (sample_descriptor_pool && DestroyDescriptorPool)
+         DestroyDescriptorPool(device, sample_descriptor_pool, nullptr);
+      if (sample_descriptor_layout && DestroyDescriptorSetLayout)
+         DestroyDescriptorSetLayout(device, sample_descriptor_layout, nullptr);
+      if (sampler && DestroySampler)
+         DestroySampler(device, sampler, nullptr);
+      if (sampled_image_view && DestroyImageView)
+         DestroyImageView(device, sampled_image_view, nullptr);
+      if (output_image_view && DestroyImageView)
+         DestroyImageView(device, output_image_view, nullptr);
+      if (sampled_image && DestroyImage)
+         DestroyImage(device, sampled_image, nullptr);
+      if (output_image && DestroyImage)
+         DestroyImage(device, output_image, nullptr);
+      if (sampled_image_memory && FreeMemory)
+         FreeMemory(device, sampled_image_memory, nullptr);
+      if (output_image_memory && FreeMemory)
+         FreeMemory(device, output_image_memory, nullptr);
       if (compute_pipeline && DestroyPipeline)
          DestroyPipeline(device, compute_pipeline, nullptr);
       if (compute_pipeline_layout && DestroyPipelineLayout)
@@ -295,14 +365,21 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !BindBufferMemory || !MapMemory || !UnmapMemory ||
        !FlushMappedMemoryRanges || !InvalidateMappedMemoryRanges ||
        !CreateCommandPool || !DestroyCommandPool || !AllocateCommandBuffers ||
-       !BeginCommandBuffer || !CmdCopyBuffer || !CreateDescriptorSetLayout ||
+       !BeginCommandBuffer || !CmdCopyBuffer || !CreateImage || !DestroyImage ||
+       !GetImageMemoryRequirements || !BindImageMemory ||
+       !CmdCopyBufferToImage || !CmdCopyImageToBuffer || !CreateImageView ||
+       !DestroyImageView || !CreateSampler || !DestroySampler ||
+       !CreateDescriptorSetLayout ||
        !DestroyDescriptorSetLayout || !CreateDescriptorPool ||
        !DestroyDescriptorPool || !AllocateDescriptorSets ||
        !UpdateDescriptorSets || !CreateShaderModule || !DestroyShaderModule ||
        !CreatePipelineLayout || !DestroyPipelineLayout ||
-       !CreateComputePipelines || !DestroyPipeline || !CmdBindPipeline ||
+       !CreateComputePipelines || !CreateGraphicsPipelines ||
+       !DestroyPipeline || !CmdBindPipeline ||
        !CmdBindDescriptorSets || !CmdDispatch || !CmdPipelineBarrier ||
-       !EndCommandBuffer ||
+       !CreateRenderPass || !DestroyRenderPass || !CreateFramebuffer ||
+       !DestroyFramebuffer || !CmdBeginRenderPass || !CmdEndRenderPass ||
+       !CmdDraw || !EndCommandBuffer ||
        !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
       cleanup();
@@ -637,6 +714,512 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
         label, compute_expected.size(),
         static_cast<unsigned long long>(compute_actual_hash), memory_type,
         memory_flags);
+
+   constexpr uint32_t image_width = 8;
+   constexpr uint32_t image_height = 8;
+   constexpr VkDeviceSize image_size = image_width * image_height * 4;
+   static_assert(image_size <= size, "probe buffers must hold the image");
+   constexpr VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
+   VkImageFormatProperties sampled_properties{};
+   result = GetPhysicalDeviceImageFormatProperties(
+      physical, image_format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+         VK_IMAGE_USAGE_SAMPLED_BIT,
+      0, &sampled_properties);
+   if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+      LOGI("image-transfer[%s]: SKIP unsupported sampled RGBA8 image", label);
+      cleanup();
+      return false;
+   }
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkGetPhysicalDeviceImageFormatProperties",
+                    result);
+   VkImageFormatProperties output_properties{};
+   result = GetPhysicalDeviceImageFormatProperties(
+      physical, image_format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      0, &output_properties);
+   if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+      LOGI("sample[%s]: SKIP unsupported color-attachment RGBA8 image", label);
+      cleanup();
+      return false;
+   }
+   if (result != VK_SUCCESS)
+      return failed("sample vkGetPhysicalDeviceImageFormatProperties", result);
+   if (sampled_properties.maxExtent.width < image_width ||
+       sampled_properties.maxExtent.height < image_height ||
+       !(sampled_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT) ||
+       output_properties.maxExtent.width < image_width ||
+       output_properties.maxExtent.height < image_height ||
+       !(output_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT)) {
+      LOGI("image-transfer[%s]: SKIP unsupported 8x8 RGBA8 image", label);
+      cleanup();
+      return false;
+   }
+
+   std::array<uint8_t, image_size> checkerboard{};
+   for (uint32_t y = 0; y < image_height; ++y) {
+      for (uint32_t x = 0; x < image_width; ++x) {
+         const size_t offset = (y * image_width + x) * 4;
+         checkerboard[offset] = x < 3 ? 255 : 0;
+         checkerboard[offset + 1] = x == 6 ? 255 : 0;
+         checkerboard[offset + 2] = y < 2 ? 255 : 0;
+         checkerboard[offset + 3] = y == 5 ? 255 : 0;
+         if (x == 1 && y == 6)
+            checkerboard[offset] = checkerboard[offset + 1] =
+               checkerboard[offset + 2] = checkerboard[offset + 3] = 255;
+      }
+   }
+   std::memcpy(src_map, checkerboard.data(), image_size);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = src_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("image-transfer vkFlushMappedMemoryRanges", result);
+   }
+
+   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+   image_info.imageType = VK_IMAGE_TYPE_2D;
+   image_info.format = image_format;
+   image_info.extent = {image_width, image_height, 1};
+   image_info.mipLevels = 1;
+   image_info.arrayLayers = 1;
+   image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_SAMPLED_BIT;
+   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+   result = CreateImage(device, &image_info, nullptr, &sampled_image);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkCreateImage", result);
+   image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   result = CreateImage(device, &image_info, nullptr, &output_image);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateImage", result);
+
+   auto allocate_image_memory = [&](VkImage image, VkDeviceMemory *memory,
+                                    const char *operation) {
+      VkMemoryRequirements requirements{};
+      GetImageMemoryRequirements(device, image, &requirements);
+      uint32_t type = UINT32_MAX;
+      for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+         if ((requirements.memoryTypeBits & (1u << i)) &&
+             (memory_properties.memoryTypes[i].propertyFlags &
+              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            type = i;
+            break;
+         }
+      }
+      if (type == UINT32_MAX) {
+         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+            if (requirements.memoryTypeBits & (1u << i)) {
+               type = i;
+               break;
+            }
+         }
+      }
+      if (type == UINT32_MAX) {
+         LOGE("%s[%s]: no compatible image memory type", operation, label);
+         return false;
+      }
+      VkMemoryAllocateInfo image_alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      image_alloc.allocationSize = requirements.size;
+      image_alloc.memoryTypeIndex = type;
+      VkResult image_result =
+         AllocateMemory(device, &image_alloc, nullptr, memory);
+      if (image_result != VK_SUCCESS) {
+         LOGE("%s[%s]: vkAllocateMemory failed: %d", operation, label,
+              image_result);
+         return false;
+      }
+      image_result = BindImageMemory(device, image, *memory, 0);
+      if (image_result != VK_SUCCESS) {
+         LOGE("%s[%s]: vkBindImageMemory failed: %d", operation, label,
+              image_result);
+         return false;
+      }
+      return true;
+   };
+   if (!allocate_image_memory(sampled_image, &sampled_image_memory,
+                              "image-transfer") ||
+       !allocate_image_memory(output_image, &output_image_memory, "sample")) {
+      cleanup();
+      return false;
+   }
+
+   VkCommandBuffer image_command{};
+   result = AllocateCommandBuffers(device, &command_info, &image_command);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkAllocateCommandBuffers", result);
+   result = BeginCommandBuffer(image_command, &begin_info);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkBeginCommandBuffer", result);
+   VkImageMemoryBarrier image_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+   image_barrier.srcAccessMask = 0;
+   image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+   image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   image_barrier.image = sampled_image;
+   image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   image_barrier.subresourceRange.levelCount = 1;
+   image_barrier.subresourceRange.layerCount = 1;
+   CmdPipelineBarrier(image_command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                      nullptr, 1, &image_barrier);
+   VkBufferImageCopy image_copy{};
+   image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   image_copy.imageSubresource.layerCount = 1;
+   image_copy.imageExtent = {image_width, image_height, 1};
+   CmdCopyBufferToImage(image_command, src, sampled_image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
+   image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+   image_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   CmdPipelineBarrier(image_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                      nullptr, 1, &image_barrier);
+   CmdCopyImageToBuffer(image_command, sampled_image,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1,
+                        &image_copy);
+   VkBufferMemoryBarrier transfer_host_barrier{
+      VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+   transfer_host_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   transfer_host_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+   transfer_host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   transfer_host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   transfer_host_barrier.buffer = dst;
+   transfer_host_barrier.size = image_size;
+   CmdPipelineBarrier(image_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                      &transfer_host_barrier, 0, nullptr);
+   result = EndCommandBuffer(image_command);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkEndCommandBuffer", result);
+   submit.pCommandBuffers = &image_command;
+   result = QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkQueueSubmit", result);
+   result = QueueWaitIdle(queue);
+   if (result != VK_SUCCESS)
+      return failed("image-transfer vkQueueWaitIdle", result);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = InvalidateMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("image-transfer vkInvalidateMappedMemoryRanges", result);
+   }
+
+   uint64_t image_expected_hash = 1469598103934665603ull;
+   uint64_t image_actual_hash = 1469598103934665603ull;
+   for (VkDeviceSize i = 0; i < image_size; ++i) {
+      image_expected_hash =
+         (image_expected_hash ^ checkerboard[i]) * 1099511628211ull;
+      image_actual_hash =
+         (image_actual_hash ^ actual_bytes[i]) * 1099511628211ull;
+   }
+   if (std::memcmp(checkerboard.data(), dst_map, image_size) != 0) {
+      VkDeviceSize first = 0;
+      while (first < image_size && checkerboard[first] == actual_bytes[first])
+         ++first;
+      LOGE("image-transfer[%s]: FAIL byte=%llu expected=%02x actual=%02x "
+           "expected_hash=%016llx actual_hash=%016llx",
+           label, static_cast<unsigned long long>(first), checkerboard[first],
+           actual_bytes[first],
+           static_cast<unsigned long long>(image_expected_hash),
+           static_cast<unsigned long long>(image_actual_hash));
+      cleanup();
+      return false;
+   }
+   LOGI("image-transfer[%s]: PASS extent=8x8 hash=%016llx", label,
+        static_cast<unsigned long long>(image_actual_hash));
+
+   VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+   view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+   view_info.format = image_format;
+   view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   view_info.subresourceRange.levelCount = 1;
+   view_info.subresourceRange.layerCount = 1;
+   view_info.image = sampled_image;
+   result = CreateImageView(device, &view_info, nullptr, &sampled_image_view);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateImageView(source)", result);
+   view_info.image = output_image;
+   result = CreateImageView(device, &view_info, nullptr, &output_image_view);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateImageView(output)", result);
+
+   VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+   sampler_info.magFilter = VK_FILTER_NEAREST;
+   sampler_info.minFilter = VK_FILTER_NEAREST;
+   sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+   sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   sampler_info.maxLod = 0.0f;
+   result = CreateSampler(device, &sampler_info, nullptr, &sampler);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateSampler", result);
+
+   VkDescriptorSetLayoutBinding sample_binding{};
+   sample_binding.binding = 0;
+   sample_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   sample_binding.descriptorCount = 1;
+   sample_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+   descriptor_layout_info.pBindings = &sample_binding;
+   result = CreateDescriptorSetLayout(device, &descriptor_layout_info, nullptr,
+                                      &sample_descriptor_layout);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateDescriptorSetLayout", result);
+   VkDescriptorPoolSize sample_pool_size{
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+   descriptor_pool_info.pPoolSizes = &sample_pool_size;
+   result = CreateDescriptorPool(device, &descriptor_pool_info, nullptr,
+                                 &sample_descriptor_pool);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateDescriptorPool", result);
+   VkDescriptorSet sample_descriptor_set{};
+   descriptor_allocate_info.descriptorPool = sample_descriptor_pool;
+   descriptor_allocate_info.pSetLayouts = &sample_descriptor_layout;
+   result = AllocateDescriptorSets(device, &descriptor_allocate_info,
+                                   &sample_descriptor_set);
+   if (result != VK_SUCCESS)
+      return failed("sample vkAllocateDescriptorSets", result);
+   VkDescriptorImageInfo descriptor_image{};
+   descriptor_image.sampler = sampler;
+   descriptor_image.imageView = sampled_image_view;
+   descriptor_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+   descriptor_write.dstSet = sample_descriptor_set;
+   descriptor_write.descriptorType =
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   descriptor_write.pBufferInfo = nullptr;
+   descriptor_write.pImageInfo = &descriptor_image;
+   UpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
+
+   shader_info.codeSize = sizeof(panvk_sample_vert_spv);
+   shader_info.pCode = panvk_sample_vert_spv;
+   result = CreateShaderModule(device, &shader_info, nullptr,
+                               &sample_vertex_shader);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateShaderModule(vertex)", result);
+   shader_info.codeSize = sizeof(panvk_sample_frag_spv);
+   shader_info.pCode = panvk_sample_frag_spv;
+   result = CreateShaderModule(device, &shader_info, nullptr,
+                               &sample_fragment_shader);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateShaderModule(fragment)", result);
+   pipeline_layout_info.pSetLayouts = &sample_descriptor_layout;
+   result = CreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &sample_pipeline_layout);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreatePipelineLayout", result);
+
+   VkAttachmentDescription color_attachment{};
+   color_attachment.format = image_format;
+   color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+   color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+   color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   color_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   color_attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   color_attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   VkAttachmentReference color_reference{0,
+                                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+   VkSubpassDescription subpass{};
+   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+   subpass.colorAttachmentCount = 1;
+   subpass.pColorAttachments = &color_reference;
+   VkRenderPassCreateInfo render_pass_info{
+      VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+   render_pass_info.attachmentCount = 1;
+   render_pass_info.pAttachments = &color_attachment;
+   render_pass_info.subpassCount = 1;
+   render_pass_info.pSubpasses = &subpass;
+   result = CreateRenderPass(device, &render_pass_info, nullptr,
+                             &sample_render_pass);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateRenderPass", result);
+   VkFramebufferCreateInfo framebuffer_info{
+      VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+   framebuffer_info.renderPass = sample_render_pass;
+   framebuffer_info.attachmentCount = 1;
+   framebuffer_info.pAttachments = &output_image_view;
+   framebuffer_info.width = image_width;
+   framebuffer_info.height = image_height;
+   framebuffer_info.layers = 1;
+   result = CreateFramebuffer(device, &framebuffer_info, nullptr,
+                              &sample_framebuffer);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateFramebuffer", result);
+
+   VkPipelineShaderStageCreateInfo sample_stages[2] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_VERTEX_BIT, sample_vertex_shader, "main", nullptr},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_FRAGMENT_BIT, sample_fragment_shader, "main", nullptr},
+   };
+   VkPipelineVertexInputStateCreateInfo vertex_input{
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+   VkPipelineInputAssemblyStateCreateInfo input_assembly{
+      VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+   input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   VkViewport viewport{0.0f, 0.0f, static_cast<float>(image_width),
+                       static_cast<float>(image_height), 0.0f, 1.0f};
+   VkRect2D scissor{{0, 0}, {image_width, image_height}};
+   VkPipelineViewportStateCreateInfo viewport_state{
+      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+   viewport_state.viewportCount = 1;
+   viewport_state.pViewports = &viewport;
+   viewport_state.scissorCount = 1;
+   viewport_state.pScissors = &scissor;
+   VkPipelineRasterizationStateCreateInfo rasterization{
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+   rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+   rasterization.cullMode = VK_CULL_MODE_NONE;
+   rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+   rasterization.lineWidth = 1.0f;
+   VkPipelineMultisampleStateCreateInfo multisample{
+      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+   multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+   VkPipelineColorBlendAttachmentState blend_attachment{};
+   blend_attachment.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+   VkPipelineColorBlendStateCreateInfo blend{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+   blend.attachmentCount = 1;
+   blend.pAttachments = &blend_attachment;
+   VkGraphicsPipelineCreateInfo graphics_info{
+      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+   graphics_info.stageCount = 2;
+   graphics_info.pStages = sample_stages;
+   graphics_info.pVertexInputState = &vertex_input;
+   graphics_info.pInputAssemblyState = &input_assembly;
+   graphics_info.pViewportState = &viewport_state;
+   graphics_info.pRasterizationState = &rasterization;
+   graphics_info.pMultisampleState = &multisample;
+   graphics_info.pColorBlendState = &blend;
+   graphics_info.layout = sample_pipeline_layout;
+   graphics_info.renderPass = sample_render_pass;
+   result = CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &graphics_info,
+                                    nullptr, &sample_pipeline);
+   if (result != VK_SUCCESS)
+      return failed("sample vkCreateGraphicsPipelines", result);
+
+   VkCommandBuffer sample_command{};
+   result = AllocateCommandBuffers(device, &command_info, &sample_command);
+   if (result != VK_SUCCESS)
+      return failed("sample vkAllocateCommandBuffers", result);
+   std::memset(dst_map, 0x5a, image_size);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("sample vkFlushMappedMemoryRanges", result);
+   }
+   result = BeginCommandBuffer(sample_command, &begin_info);
+   if (result != VK_SUCCESS)
+      return failed("sample vkBeginCommandBuffer", result);
+   VkImageMemoryBarrier sample_barriers[2] = {
+      {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+       VK_ACCESS_SHADER_READ_BIT,
+       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+       VK_QUEUE_FAMILY_IGNORED, sampled_image,
+       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+      {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+       VK_QUEUE_FAMILY_IGNORED, output_image,
+       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+   };
+   CmdPipelineBarrier(sample_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      0, 0, nullptr, 0, nullptr, 2, sample_barriers);
+   VkRenderPassBeginInfo render_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+   render_begin.renderPass = sample_render_pass;
+   render_begin.framebuffer = sample_framebuffer;
+   render_begin.renderArea = scissor;
+   CmdBeginRenderPass(sample_command, &render_begin, VK_SUBPASS_CONTENTS_INLINE);
+   CmdBindPipeline(sample_command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                   sample_pipeline);
+   CmdBindDescriptorSets(sample_command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                         sample_pipeline_layout, 0, 1, &sample_descriptor_set,
+                         0, nullptr);
+   CmdDraw(sample_command, 3, 1, 0, 0);
+   CmdEndRenderPass(sample_command);
+   VkImageMemoryBarrier output_barrier{
+      VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+   output_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+   output_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+   output_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   output_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   output_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   output_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   output_barrier.image = output_image;
+   output_barrier.subresourceRange =
+      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+   CmdPipelineBarrier(sample_command,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                      nullptr, 1, &output_barrier);
+   CmdCopyImageToBuffer(sample_command, output_image,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1,
+                        &image_copy);
+   CmdPipelineBarrier(sample_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                      &transfer_host_barrier, 0, nullptr);
+   result = EndCommandBuffer(sample_command);
+   if (result != VK_SUCCESS)
+      return failed("sample vkEndCommandBuffer", result);
+   submit.pCommandBuffers = &sample_command;
+   result = QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+   if (result != VK_SUCCESS)
+      return failed("sample vkQueueSubmit", result);
+   result = QueueWaitIdle(queue);
+   if (result != VK_SUCCESS)
+      return failed("sample vkQueueWaitIdle", result);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = InvalidateMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("sample vkInvalidateMappedMemoryRanges", result);
+   }
+
+   uint64_t sample_actual_hash = 1469598103934665603ull;
+   for (VkDeviceSize i = 0; i < image_size; ++i)
+      sample_actual_hash =
+         (sample_actual_hash ^ actual_bytes[i]) * 1099511628211ull;
+   if (std::memcmp(checkerboard.data(), dst_map, image_size) != 0) {
+      VkDeviceSize first = 0;
+      while (first < image_size && checkerboard[first] == actual_bytes[first])
+         ++first;
+      LOGE("sample[%s]: FAIL byte=%llu expected=%02x actual=%02x "
+           "expected_hash=%016llx actual_hash=%016llx",
+           label, static_cast<unsigned long long>(first), checkerboard[first],
+           actual_bytes[first],
+           static_cast<unsigned long long>(image_expected_hash),
+           static_cast<unsigned long long>(sample_actual_hash));
+      cleanup();
+      return false;
+   }
+   LOGI("sample[%s]: PASS extent=8x8 hash=%016llx", label,
+        static_cast<unsigned long long>(sample_actual_hash));
    cleanup();
    return true;
 }

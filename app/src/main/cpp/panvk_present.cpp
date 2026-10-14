@@ -1,7 +1,10 @@
 #include "panvk_present.h"
 
 #include <android/log.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <strings.h>
+#include <unistd.h>
 
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -9,10 +12,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
+#include "panvk_async_spv.h"
 #include "panvk_compute_spv.h"
 #include "panvk_draw_frag_spv.h"
 #include "panvk_draw_vert_spv.h"
@@ -265,6 +271,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkCreateCommandPool, CreateCommandPool);
    DEVICE_PROC(PFN_vkDestroyCommandPool, DestroyCommandPool);
    DEVICE_PROC(PFN_vkAllocateCommandBuffers, AllocateCommandBuffers);
+   DEVICE_PROC(PFN_vkResetCommandBuffer, ResetCommandBuffer);
    DEVICE_PROC(PFN_vkBeginCommandBuffer, BeginCommandBuffer);
    DEVICE_PROC(PFN_vkCmdCopyBuffer, CmdCopyBuffer);
    DEVICE_PROC(PFN_vkCreateImage, CreateImage);
@@ -305,6 +312,11 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkCmdPushConstants, CmdPushConstants);
    DEVICE_PROC(PFN_vkCmdPipelineBarrier, CmdPipelineBarrier);
    DEVICE_PROC(PFN_vkEndCommandBuffer, EndCommandBuffer);
+   DEVICE_PROC(PFN_vkCreateFence, CreateFence);
+   DEVICE_PROC(PFN_vkDestroyFence, DestroyFence);
+   DEVICE_PROC(PFN_vkGetFenceStatus, GetFenceStatus);
+   DEVICE_PROC(PFN_vkResetFences, ResetFences);
+   DEVICE_PROC(PFN_vkWaitForFences, WaitForFences);
    DEVICE_PROC(PFN_vkQueueSubmit, QueueSubmit);
    DEVICE_PROC(PFN_vkQueueWaitIdle, QueueWaitIdle);
    DEVICE_PROC(PFN_vkDeviceWaitIdle, DeviceWaitIdle);
@@ -404,7 +416,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !BindBufferMemory || !MapMemory || !UnmapMemory ||
        !FlushMappedMemoryRanges || !InvalidateMappedMemoryRanges ||
        !CreateCommandPool || !DestroyCommandPool || !AllocateCommandBuffers ||
-       !BeginCommandBuffer || !CmdCopyBuffer || !CreateImage || !DestroyImage ||
+       !ResetCommandBuffer || !BeginCommandBuffer || !CmdCopyBuffer ||
+       !CreateImage || !DestroyImage ||
        !GetImageMemoryRequirements || !BindImageMemory ||
        !CmdCopyBufferToImage || !CmdCopyImageToBuffer || !CreateImageView ||
        !DestroyImageView || !CreateSampler || !DestroySampler ||
@@ -420,7 +433,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !DestroyFramebuffer || !CmdBeginRenderPass || !CmdEndRenderPass ||
        !CmdDraw || !CmdBindIndexBuffer || !CmdDrawIndexed ||
        !CmdPushConstants || !EndCommandBuffer ||
-       !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
+       !CreateFence || !DestroyFence || !GetFenceStatus || !ResetFences ||
+       !WaitForFences || !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
       cleanup();
       return false;
@@ -755,6 +769,544 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
         label, compute_expected.size(),
         static_cast<unsigned long long>(compute_actual_hash), memory_type,
         memory_flags);
+
+   auto async_submission_probe = [&]() {
+      constexpr uint32_t stamp_count = 4096;
+      constexpr uint32_t wave_size = 256;
+      constexpr uint32_t wave_count = stamp_count / wave_size;
+      constexpr uint32_t chain_size = 121;
+      constexpr uint32_t stamp_sentinel = 0xcdcdcdcdu;
+      constexpr uint32_t error_sentinel = 0xffffffffu;
+      constexpr uint32_t guard_front = 0x13579bdfu;
+      constexpr uint32_t guard_back = 0xfdb97531u;
+      constexpr uint32_t waves_terminal = 0x57415645u;
+      constexpr uint32_t chain_terminal = 0x43484149u;
+      constexpr uint32_t state_words = 4 + stamp_count + 1;
+      constexpr VkDeviceSize state_size = state_words * sizeof(uint32_t);
+      constexpr uint64_t fence_timeout_ns = 30ull * 1000 * 1000 * 1000;
+      VkBuffer state_buffer{};
+      VkDeviceMemory state_memory{};
+      void *state_map{};
+      VkDescriptorSetLayout async_descriptor_layout{};
+      VkDescriptorPool async_descriptor_pool{};
+      VkShaderModule async_shader{};
+      VkPipelineLayout async_pipeline_layout{};
+      VkPipeline async_pipeline{};
+      VkCommandPool async_pool{};
+      VkFence async_fence{};
+      std::array<VkCommandBuffer, wave_size> commands{};
+      bool submitted = false;
+
+      auto debug_has = [](const char *value, const char *wanted) {
+         if (!value)
+            return false;
+         const size_t wanted_length = std::strlen(wanted);
+         for (const char *token = value; *token;) {
+            while (*token == ',' || *token == ';' || *token == ':' ||
+                   *token == ' ' || *token == '\t')
+               ++token;
+            const char *end = token;
+            while (*end && *end != ',' && *end != ';' && *end != ':' &&
+                   *end != ' ' && *end != '\t')
+               ++end;
+            if (static_cast<size_t>(end - token) == wanted_length &&
+                std::memcmp(token, wanted, wanted_length) == 0)
+               return true;
+            token = end;
+         }
+         return false;
+      };
+      auto enabled_bool_option = [](const char *value) {
+         return value &&
+                (!std::strcmp(value, "1") || !strcasecmp(value, "y") ||
+                 !strcasecmp(value, "yes") || !strcasecmp(value, "t") ||
+                 !strcasecmp(value, "true"));
+      };
+      if (std::strcmp(label, "panvk") == 0) {
+         const bool wait_submit = std::getenv("PANVK_KBASE_WAIT_SUBMIT");
+         const bool sync_submit = std::getenv("PANVK_KBASE_SYNC_SUBMIT");
+         const bool v9_trace =
+            enabled_bool_option(std::getenv("PANVK_V9_TRACE"));
+         const bool heap_log = std::getenv("PANVK_HEAP_LOG");
+         const char *debug = std::getenv("PANVK_DEBUG");
+         const bool debug_all = debug_has(debug, "all");
+         const bool debug_trace = debug_all || debug_has(debug, "trace");
+         const bool debug_dump = debug_all || debug_has(debug, "dump");
+         const bool asynchronous =
+            !(wait_submit || sync_submit || v9_trace || heap_log ||
+              debug_trace || debug_dump);
+         LOGI("jm-async[%s]: MODE wait_submit=%u sync_submit=%u v9_trace=%u "
+              "heap_log=%u debug_trace=%u debug_dump=%u asynchronous=%u",
+              label, wait_submit, sync_submit, v9_trace, heap_log, debug_trace,
+              debug_dump, asynchronous);
+         if (!asynchronous) {
+            LOGE("jm-async[%s]: NON_COUNTING reason=non-asynchronous-mode",
+                 label);
+            return false;
+         }
+      } else {
+         LOGI("jm-async[%s]: MODE asynchronous=n/a", label);
+      }
+
+      struct ResourceSnapshot {
+         long fds = -1;
+         long maps = -1;
+         long rss_kb = -1;
+         long size_kb = -1;
+      };
+      auto resource_snapshot = []() {
+         ResourceSnapshot snapshot;
+         if (DIR *directory = opendir("/proc/self/fd")) {
+            snapshot.fds = 0;
+            while (dirent *entry = readdir(directory)) {
+               if (std::strcmp(entry->d_name, ".") &&
+                   std::strcmp(entry->d_name, ".."))
+                  ++snapshot.fds;
+            }
+            closedir(directory);
+         }
+         if (FILE *maps = std::fopen("/proc/self/maps", "r")) {
+            snapshot.maps = 0;
+            int character = 0;
+            int last = '\n';
+            while ((character = std::fgetc(maps)) != EOF) {
+               if (character == '\n')
+                  ++snapshot.maps;
+               last = character;
+            }
+            if (last != '\n')
+               ++snapshot.maps;
+            std::fclose(maps);
+         }
+         if (FILE *status = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), status)) {
+               std::sscanf(line, "VmRSS: %ld kB", &snapshot.rss_kb);
+               std::sscanf(line, "VmSize: %ld kB", &snapshot.size_kb);
+            }
+            std::fclose(status);
+         }
+         return snapshot;
+      };
+      const ResourceSnapshot resources_before = resource_snapshot();
+
+      auto async_cleanup = [&]() {
+         if (state_map)
+            UnmapMemory(device, state_memory);
+         if (async_fence)
+            DestroyFence(device, async_fence, nullptr);
+         if (async_pool)
+            DestroyCommandPool(device, async_pool, nullptr);
+         if (async_pipeline)
+            DestroyPipeline(device, async_pipeline, nullptr);
+         if (async_pipeline_layout)
+            DestroyPipelineLayout(device, async_pipeline_layout, nullptr);
+         if (async_shader)
+            DestroyShaderModule(device, async_shader, nullptr);
+         if (async_descriptor_pool)
+            DestroyDescriptorPool(device, async_descriptor_pool, nullptr);
+         if (async_descriptor_layout)
+            DestroyDescriptorSetLayout(device, async_descriptor_layout,
+                                       nullptr);
+         if (state_buffer)
+            DestroyBuffer(device, state_buffer, nullptr);
+         if (state_memory)
+            FreeMemory(device, state_memory, nullptr);
+      };
+      auto async_failed = [&](const char *operation, VkResult failure) {
+         LOGE("jm-async[%s]: FAIL operation=%s result=%d submitted=%u", label,
+              operation, failure, submitted ? 1u : 0u);
+         if (submitted)
+            _exit(124);
+         async_cleanup();
+         return false;
+      };
+
+      VkBufferCreateInfo async_buffer_info{
+         VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      async_buffer_info.size = state_size;
+      async_buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      async_buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      VkResult async_result = CreateBuffer(device, &async_buffer_info, nullptr,
+                                           &state_buffer);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateBuffer", async_result);
+      VkMemoryRequirements async_requirements{};
+      GetBufferMemoryRequirements(device, state_buffer, &async_requirements);
+      uint32_t async_memory_type = UINT32_MAX;
+      for (uint32_t pass = 0; pass < 2 && async_memory_type == UINT32_MAX;
+           ++pass) {
+         for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags flags =
+               memory_properties.memoryTypes[i].propertyFlags;
+            if ((async_requirements.memoryTypeBits & (1u << i)) &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                (pass || !(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
+               async_memory_type = i;
+               break;
+            }
+         }
+      }
+      if (async_memory_type == UINT32_MAX) {
+         LOGE("jm-async[%s]: FAIL reason=no-host-visible-memory", label);
+         async_cleanup();
+         return false;
+      }
+      const VkMemoryPropertyFlags async_memory_flags =
+         memory_properties.memoryTypes[async_memory_type].propertyFlags;
+      VkMemoryAllocateInfo async_alloc_info{
+         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      async_alloc_info.allocationSize = async_requirements.size;
+      async_alloc_info.memoryTypeIndex = async_memory_type;
+      async_result = AllocateMemory(device, &async_alloc_info, nullptr,
+                                    &state_memory);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkAllocateMemory", async_result);
+      async_result = BindBufferMemory(device, state_buffer, state_memory, 0);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkBindBufferMemory", async_result);
+      async_result = MapMemory(device, state_memory, 0, VK_WHOLE_SIZE, 0,
+                               &state_map);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkMapMemory", async_result);
+
+      VkDescriptorSetLayoutBinding async_binding{};
+      async_binding.binding = 0;
+      async_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      async_binding.descriptorCount = 1;
+      async_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      VkDescriptorSetLayoutCreateInfo async_layout_info{
+         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+      async_layout_info.bindingCount = 1;
+      async_layout_info.pBindings = &async_binding;
+      async_result = CreateDescriptorSetLayout(
+         device, &async_layout_info, nullptr, &async_descriptor_layout);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateDescriptorSetLayout", async_result);
+      VkDescriptorPoolSize async_pool_size{
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+      VkDescriptorPoolCreateInfo async_descriptor_pool_info{
+         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      async_descriptor_pool_info.maxSets = 1;
+      async_descriptor_pool_info.poolSizeCount = 1;
+      async_descriptor_pool_info.pPoolSizes = &async_pool_size;
+      async_result = CreateDescriptorPool(device, &async_descriptor_pool_info,
+                                          nullptr, &async_descriptor_pool);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateDescriptorPool", async_result);
+      VkDescriptorSet async_descriptor_set{};
+      VkDescriptorSetAllocateInfo async_descriptor_allocate_info{
+         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      async_descriptor_allocate_info.descriptorPool = async_descriptor_pool;
+      async_descriptor_allocate_info.descriptorSetCount = 1;
+      async_descriptor_allocate_info.pSetLayouts = &async_descriptor_layout;
+      async_result = AllocateDescriptorSets(
+         device, &async_descriptor_allocate_info, &async_descriptor_set);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkAllocateDescriptorSets", async_result);
+      VkDescriptorBufferInfo async_descriptor_buffer{state_buffer, 0,
+                                                     state_size};
+      VkWriteDescriptorSet async_descriptor_write{
+         VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      async_descriptor_write.dstSet = async_descriptor_set;
+      async_descriptor_write.dstBinding = 0;
+      async_descriptor_write.descriptorCount = 1;
+      async_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      async_descriptor_write.pBufferInfo = &async_descriptor_buffer;
+      UpdateDescriptorSets(device, 1, &async_descriptor_write, 0, nullptr);
+
+      VkShaderModuleCreateInfo async_shader_info{
+         VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      async_shader_info.codeSize = sizeof(panvk_async_spv_bytes);
+      async_shader_info.pCode = reinterpret_cast<const uint32_t *>(
+         panvk_async_spv_bytes);
+      async_result = CreateShaderModule(device, &async_shader_info, nullptr,
+                                        &async_shader);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateShaderModule", async_result);
+      VkPushConstantRange async_push_range{};
+      async_push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      async_push_range.size = 3 * sizeof(uint32_t);
+      VkPipelineLayoutCreateInfo async_pipeline_layout_info{
+         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      async_pipeline_layout_info.setLayoutCount = 1;
+      async_pipeline_layout_info.pSetLayouts = &async_descriptor_layout;
+      async_pipeline_layout_info.pushConstantRangeCount = 1;
+      async_pipeline_layout_info.pPushConstantRanges = &async_push_range;
+      async_result = CreatePipelineLayout(device, &async_pipeline_layout_info,
+                                          nullptr, &async_pipeline_layout);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreatePipelineLayout", async_result);
+      VkPipelineShaderStageCreateInfo async_stage{
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+      async_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      async_stage.module = async_shader;
+      async_stage.pName = "main";
+      VkComputePipelineCreateInfo async_pipeline_info{
+         VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      async_pipeline_info.stage = async_stage;
+      async_pipeline_info.layout = async_pipeline_layout;
+      async_result = CreateComputePipelines(device, VK_NULL_HANDLE, 1,
+                                            &async_pipeline_info, nullptr,
+                                            &async_pipeline);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateComputePipelines", async_result);
+
+      VkCommandPoolCreateInfo async_command_pool_info{
+         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      async_command_pool_info.flags =
+         VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+      async_command_pool_info.queueFamilyIndex = queue_family;
+      async_result = CreateCommandPool(device, &async_command_pool_info,
+                                       nullptr, &async_pool);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateCommandPool", async_result);
+      VkCommandBufferAllocateInfo async_command_allocate_info{
+         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      async_command_allocate_info.commandPool = async_pool;
+      async_command_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      async_command_allocate_info.commandBufferCount = commands.size();
+      async_result = AllocateCommandBuffers(device,
+                                            &async_command_allocate_info,
+                                            commands.data());
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkAllocateCommandBuffers", async_result);
+      VkFenceCreateInfo async_fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      async_result = CreateFence(device, &async_fence_info, nullptr,
+                                 &async_fence);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateFence", async_result);
+
+      auto initialize_state = [&]() {
+         auto *words = static_cast<uint32_t *>(state_map);
+         words[0] = guard_front;
+         words[1] = 0;
+         words[2] = error_sentinel;
+         words[3] = stamp_sentinel;
+         std::fill(words + 4, words + 4 + stamp_count, stamp_sentinel);
+         words[state_words - 1] = guard_back;
+         if (async_memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            return VK_SUCCESS;
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = state_memory;
+         range.size = VK_WHOLE_SIZE;
+         return FlushMappedMemoryRanges(device, 1, &range);
+      };
+      auto invalidate_state = [&]() {
+         if (async_memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            return VK_SUCCESS;
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = state_memory;
+         range.size = VK_WHOLE_SIZE;
+         return InvalidateMappedMemoryRanges(device, 1, &range);
+      };
+      auto verify_state = [&](uint32_t completed, uint32_t terminal,
+                              const char *phase) {
+         const auto *words = static_cast<const uint32_t *>(state_map);
+         if (words[0] != guard_front || words[state_words - 1] != guard_back ||
+             words[1] != completed || words[2] != error_sentinel ||
+             words[3] != terminal) {
+            LOGE("jm-async[%s]: FAIL phase=%s counter=%u error=%08x "
+                 "guard_front=%08x sentinel=%08x guard_back=%08x",
+                 label, phase, words[1], words[2], words[0], words[3],
+                 words[state_words - 1]);
+            return false;
+         }
+         for (uint32_t i = 0; i < stamp_count; ++i) {
+            const uint32_t expected =
+               i < completed ? (i * 0x9e3779b9u) ^ 0xa5a55a5au
+                             : stamp_sentinel;
+            if (words[4 + i] != expected) {
+               LOGE("jm-async[%s]: FAIL phase=%s stamp=%u expected=%08x "
+                    "actual=%08x",
+                    label, phase, i, expected, words[4 + i]);
+               return false;
+            }
+         }
+         return true;
+      };
+      auto record = [&](VkCommandBuffer command_buffer, uint32_t expected,
+                        uint32_t terminal, bool host_written,
+                        bool host_read) {
+         VkResult command_result = ResetCommandBuffer(command_buffer, 0);
+         if (command_result != VK_SUCCESS)
+            return command_result;
+         VkCommandBufferBeginInfo async_begin{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+         async_begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         command_result = BeginCommandBuffer(command_buffer, &async_begin);
+         if (command_result != VK_SUCCESS)
+            return command_result;
+         if (host_written) {
+            VkBufferMemoryBarrier host_to_compute{
+               VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            host_to_compute.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+            host_to_compute.dstAccessMask =
+               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            host_to_compute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_to_compute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_to_compute.buffer = state_buffer;
+            host_to_compute.size = state_size;
+            CmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                               nullptr, 1, &host_to_compute, 0, nullptr);
+         }
+         CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                         async_pipeline);
+         CmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               async_pipeline_layout, 0, 1,
+                               &async_descriptor_set, 0, nullptr);
+         const uint32_t push[3] = {expected, terminal ? 1u : 0u, terminal};
+         CmdPushConstants(command_buffer, async_pipeline_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+         CmdDispatch(command_buffer, 1, 1, 1);
+         VkBufferMemoryBarrier compute_barrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+         compute_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+         compute_barrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+            (host_read ? VK_ACCESS_HOST_READ_BIT : 0);
+         compute_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         compute_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         compute_barrier.buffer = state_buffer;
+         compute_barrier.size = state_size;
+         const VkPipelineStageFlags destination_stages =
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            (host_read ? VK_PIPELINE_STAGE_HOST_BIT : 0);
+         CmdPipelineBarrier(command_buffer,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            destination_stages, 0, 0, nullptr, 1,
+                            &compute_barrier, 0, nullptr);
+         return EndCommandBuffer(command_buffer);
+      };
+      uint32_t immediate_fences = 0;
+      auto wait_for_batch = [&](const char *phase) {
+         VkResult status = GetFenceStatus(device, async_fence);
+         if (status == VK_SUCCESS)
+            ++immediate_fences;
+         else if (status != VK_NOT_READY)
+            return async_failed("vkGetFenceStatus", status);
+         VkResult wait_result = WaitForFences(device, 1, &async_fence,
+                                              VK_TRUE, fence_timeout_ns);
+         if (wait_result != VK_SUCCESS)
+            return async_failed(phase, wait_result);
+         return true;
+      };
+
+      async_result = initialize_state();
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkFlushMappedMemoryRanges(waves)", async_result);
+      for (uint32_t wave = 0; wave < wave_count; ++wave) {
+         for (uint32_t i = 0; i < wave_size; ++i) {
+            const uint32_t expected = wave * wave_size + i;
+            const uint32_t terminal =
+               expected + 1 == stamp_count ? waves_terminal : 0;
+            async_result = record(commands[i], expected, terminal,
+                                  expected == 0,
+                                  i + 1 == wave_size);
+            if (async_result != VK_SUCCESS)
+               return async_failed("record(waves)", async_result);
+         }
+         for (uint32_t i = 0; i < wave_size; ++i) {
+            VkSubmitInfo async_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            async_submit.commandBufferCount = 1;
+            async_submit.pCommandBuffers = &commands[i];
+            async_result = QueueSubmit(queue, 1, &async_submit,
+                                       i + 1 == wave_size ? async_fence
+                                                          : VK_NULL_HANDLE);
+            if (async_result != VK_SUCCESS)
+               return async_failed("vkQueueSubmit(waves)", async_result);
+            submitted = true;
+         }
+         if (!wait_for_batch("vkWaitForFences(waves)"))
+            return false;
+         submitted = false;
+         async_result = invalidate_state();
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkInvalidateMappedMemoryRanges(waves)",
+                                async_result);
+         const uint32_t expected_terminal =
+            wave + 1 == wave_count ? waves_terminal : stamp_sentinel;
+         if (!verify_state((wave + 1) * wave_size, expected_terminal,
+                           "waves")) {
+            async_cleanup();
+            return false;
+         }
+         if (wave + 1 != wave_count) {
+            async_result = ResetFences(device, 1, &async_fence);
+            if (async_result != VK_SUCCESS)
+               return async_failed("vkResetFences(waves)", async_result);
+         }
+      }
+      LOGI("jm-async[%s]: PASS mode=waves submissions=%u waves=%u live_cb=%u "
+           "terminal=%08x immediate_fences=%u",
+           label, stamp_count, wave_count, wave_size, waves_terminal,
+           immediate_fences);
+
+      async_result = ResetFences(device, 1, &async_fence);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkResetFences(chain)", async_result);
+      async_result = initialize_state();
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkFlushMappedMemoryRanges(chain)", async_result);
+      for (uint32_t i = 0; i < chain_size; ++i) {
+         async_result = record(commands[i], i,
+                               i + 1 == chain_size ? chain_terminal : 0,
+                               i == 0,
+                               i + 1 == chain_size);
+         if (async_result != VK_SUCCESS)
+            return async_failed("record(chain)", async_result);
+      }
+      VkSubmitInfo chain_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      chain_submit.commandBufferCount = chain_size;
+      chain_submit.pCommandBuffers = commands.data();
+      async_result = QueueSubmit(queue, 1, &chain_submit, async_fence);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkQueueSubmit(chain)", async_result);
+      submitted = true;
+      if (!wait_for_batch("vkWaitForFences(chain)"))
+         return false;
+      submitted = false;
+      async_result = invalidate_state();
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkInvalidateMappedMemoryRanges(chain)",
+                             async_result);
+      if (!verify_state(chain_size, chain_terminal, "chain")) {
+         async_cleanup();
+         return false;
+      }
+      LOGI("jm-async[%s]: PASS mode=single-submit-chain command_buffers=%u "
+           "terminal=%08x immediate_fences=%u",
+           label, chain_size, chain_terminal, immediate_fences);
+      async_cleanup();
+      const ResourceSnapshot resources_after = resource_snapshot();
+      const bool resource_counting =
+         resources_before.fds >= 0 && resources_after.fds >= 0 &&
+         resources_before.maps >= 0 && resources_after.maps >= 0 &&
+         resources_before.rss_kb >= 0 && resources_after.rss_kb >= 0 &&
+         resources_before.size_kb >= 0 && resources_after.size_kb >= 0;
+      auto delta = [](long before, long after) {
+         return before < 0 || after < 0 ? -1l : after - before;
+      };
+      LOGI("jm-async[%s]: RESOURCE counting=%u "
+           "fd_before=%ld fd_after=%ld fd_delta=%ld "
+           "maps_before=%ld maps_after=%ld maps_delta=%ld "
+           "rss_kb_before=%ld rss_kb_after=%ld rss_kb_delta=%ld "
+           "size_kb_before=%ld size_kb_after=%ld size_kb_delta=%ld",
+           label, resource_counting, resources_before.fds, resources_after.fds,
+           delta(resources_before.fds, resources_after.fds),
+           resources_before.maps, resources_after.maps,
+           delta(resources_before.maps, resources_after.maps),
+           resources_before.rss_kb, resources_after.rss_kb,
+           delta(resources_before.rss_kb, resources_after.rss_kb),
+           resources_before.size_kb, resources_after.size_kb,
+           delta(resources_before.size_kb, resources_after.size_kb));
+      return true;
+   };
+   if (!async_submission_probe()) {
+      cleanup();
+      return false;
+   }
 
    constexpr uint32_t image_width = 31;
    constexpr uint32_t image_height = 29;

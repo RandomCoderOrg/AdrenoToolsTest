@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer AsyncState {
+   uint guard_front;
+   uint counter;
+   uint error;
+   uint sentinel;
+   uint stamps[4096];
+   uint guard_back;
+} state;
+
+layout(push_constant) uniform PushConstants {
+   uint expected;
+   uint terminal;
+   uint terminal_value;
+} pc;
+
+void main()
+{
+   uint observed = atomicCompSwap(state.counter, pc.expected, pc.expected + 1u);
+   if (observed != pc.expected)
+      atomicCompSwap(state.error, 0xffffffffu,
+                     (pc.expected << 16) | (observed & 0xffffu));
+   else if (pc.terminal != 0u)
+      state.sentinel = pc.terminal_value;
+   state.stamps[pc.expected] = (pc.expected * 0x9e3779b9u) ^ 0xa5a55a5au;
+}

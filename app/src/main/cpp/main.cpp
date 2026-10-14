@@ -7,6 +7,8 @@
 
 #include <sys/stat.h>
 
+#include <cstdlib>
+
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
 #include <vulkan/vulkan.h>
@@ -347,6 +349,7 @@ void android_main( struct android_app *pApp )
 
 	loadOriginalVulkan();
 	copyFile( srcFolder, dstFolder, vulkanLibName );
+	setenv( "PANVK_KBASE_FENCE_TRACE", "1", 1 );
 	gVulkan = replaceDriver( dstFolder, nativeLibraryDir.c_str(), vulkanLibName );
 	if( gVulkan && pApp->window )
 		panvk_present_init( gVulkan, pApp->window );

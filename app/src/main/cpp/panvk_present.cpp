@@ -110,6 +110,7 @@ bool check(VkResult result, const char *operation)
 bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
 {
    constexpr VkDeviceSize size = 4096;
+   constexpr VkDeviceSize buffer_size = 8192;
    VkInstance instance{};
    VkDevice device{};
    VkBuffer src{};
@@ -389,7 +390,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkQueue queue{};
    GetDeviceQueue(device, queue_family, 0, &queue);
    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-   buffer_info.size = size;
+   buffer_info.size = buffer_size;
    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
    result = CreateBuffer(device, &buffer_info, nullptr, &src);
@@ -715,10 +716,20 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
         static_cast<unsigned long long>(compute_actual_hash), memory_type,
         memory_flags);
 
-   constexpr uint32_t image_width = 8;
-   constexpr uint32_t image_height = 8;
-   constexpr VkDeviceSize image_size = image_width * image_height * 4;
-   static_assert(image_size <= size, "probe buffers must hold the image");
+   constexpr uint32_t image_width = 31;
+   constexpr uint32_t image_height = 29;
+   constexpr uint32_t image_layers = 2;
+   constexpr uint32_t buffer_row_length = 32;
+   constexpr uint32_t buffer_image_height = 30;
+   constexpr VkDeviceSize row_pitch = buffer_row_length * 4;
+   constexpr VkDeviceSize layer_pitch = row_pitch * buffer_image_height;
+   constexpr VkDeviceSize image_buffer_size = layer_pitch * image_layers;
+   static_assert(row_pitch == 128, "unexpected image row pitch");
+   static_assert(layer_pitch == 3840, "unexpected image layer pitch");
+   static_assert(image_buffer_size == 7680,
+                 "unexpected image buffer size");
+   static_assert(image_buffer_size <= buffer_size,
+                 "probe buffers must hold the image layout");
    constexpr VkFormat image_format = VK_FORMAT_R8G8B8A8_UNORM;
    VkImageFormatProperties sampled_properties{};
    result = GetPhysicalDeviceImageFormatProperties(
@@ -748,29 +759,39 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       return failed("sample vkGetPhysicalDeviceImageFormatProperties", result);
    if (sampled_properties.maxExtent.width < image_width ||
        sampled_properties.maxExtent.height < image_height ||
+       sampled_properties.maxArrayLayers < image_layers ||
        !(sampled_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT) ||
        output_properties.maxExtent.width < image_width ||
        output_properties.maxExtent.height < image_height ||
        !(output_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT)) {
-      LOGI("image-transfer[%s]: SKIP unsupported 8x8 RGBA8 image", label);
+      LOGI("image-transfer[%s]: SKIP unsupported 31x29x2 RGBA8 image", label);
       cleanup();
       return false;
    }
 
-   std::array<uint8_t, image_size> checkerboard{};
-   for (uint32_t y = 0; y < image_height; ++y) {
-      for (uint32_t x = 0; x < image_width; ++x) {
-         const size_t offset = (y * image_width + x) * 4;
-         checkerboard[offset] = x < 3 ? 255 : 0;
-         checkerboard[offset + 1] = x == 6 ? 255 : 0;
-         checkerboard[offset + 2] = y < 2 ? 255 : 0;
-         checkerboard[offset + 3] = y == 5 ? 255 : 0;
-         if (x == 1 && y == 6)
-            checkerboard[offset] = checkerboard[offset + 1] =
-               checkerboard[offset + 2] = checkerboard[offset + 3] = 255;
+   constexpr uint8_t upload_sentinel = 0xa6;
+   constexpr uint8_t transfer_sentinel = 0x5a;
+   std::array<uint8_t, image_buffer_size> upload{};
+   std::array<uint8_t, image_buffer_size> transfer_expected{};
+   upload.fill(upload_sentinel);
+   transfer_expected.fill(transfer_sentinel);
+   for (uint32_t layer = 0; layer < image_layers; ++layer) {
+      for (uint32_t y = 0; y < image_height; ++y) {
+         for (uint32_t x = 0; x < image_width; ++x) {
+            const size_t offset = layer * layer_pitch + y * row_pitch + x * 4;
+            const uint8_t pixel[4] = {
+               static_cast<uint8_t>(x < 11 ? 255 : 0),
+               static_cast<uint8_t>(y < 7 ? 255 : 0),
+               static_cast<uint8_t>(layer == 1 ? 255 : 0),
+               static_cast<uint8_t>(x == 23 && y == 17 ? 255 : 0),
+            };
+            std::memcpy(upload.data() + offset, pixel, sizeof(pixel));
+            std::memcpy(transfer_expected.data() + offset, pixel,
+                        sizeof(pixel));
+         }
       }
    }
-   std::memcpy(src_map, checkerboard.data(), image_size);
+   std::memcpy(src_map, upload.data(), image_buffer_size);
    if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
       VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
       range.memory = src_memory;
@@ -785,7 +806,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    image_info.format = image_format;
    image_info.extent = {image_width, image_height, 1};
    image_info.mipLevels = 1;
-   image_info.arrayLayers = 1;
+   image_info.arrayLayers = image_layers;
    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
    image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -796,6 +817,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    result = CreateImage(device, &image_info, nullptr, &sampled_image);
    if (result != VK_SUCCESS)
       return failed("image-transfer vkCreateImage", result);
+   image_info.arrayLayers = 1;
    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
    result = CreateImage(device, &image_info, nullptr, &output_image);
@@ -856,6 +878,15 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    result = AllocateCommandBuffers(device, &command_info, &image_command);
    if (result != VK_SUCCESS)
       return failed("image-transfer vkAllocateCommandBuffers", result);
+   std::memset(dst_map, transfer_sentinel, image_buffer_size);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("image-transfer dst vkFlushMappedMemoryRanges", result);
+   }
    result = BeginCommandBuffer(image_command, &begin_info);
    if (result != VK_SUCCESS)
       return failed("image-transfer vkBeginCommandBuffer", result);
@@ -869,13 +900,16 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    image_barrier.image = sampled_image;
    image_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
    image_barrier.subresourceRange.levelCount = 1;
-   image_barrier.subresourceRange.layerCount = 1;
+   image_barrier.subresourceRange.layerCount = image_layers;
    CmdPipelineBarrier(image_command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                       nullptr, 1, &image_barrier);
    VkBufferImageCopy image_copy{};
+   image_copy.bufferRowLength = buffer_row_length;
+   image_copy.bufferImageHeight = buffer_image_height;
    image_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-   image_copy.imageSubresource.layerCount = 1;
+   image_copy.imageSubresource.baseArrayLayer = 0;
+   image_copy.imageSubresource.layerCount = image_layers;
    image_copy.imageExtent = {image_width, image_height, 1};
    CmdCopyBufferToImage(image_command, src, sampled_image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &image_copy);
@@ -896,7 +930,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    transfer_host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    transfer_host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
    transfer_host_barrier.buffer = dst;
-   transfer_host_barrier.size = image_size;
+   transfer_host_barrier.size = image_buffer_size;
    CmdPipelineBarrier(image_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
                       &transfer_host_barrier, 0, nullptr);
@@ -921,26 +955,29 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
 
    uint64_t image_expected_hash = 1469598103934665603ull;
    uint64_t image_actual_hash = 1469598103934665603ull;
-   for (VkDeviceSize i = 0; i < image_size; ++i) {
+   for (VkDeviceSize i = 0; i < image_buffer_size; ++i) {
       image_expected_hash =
-         (image_expected_hash ^ checkerboard[i]) * 1099511628211ull;
+         (image_expected_hash ^ transfer_expected[i]) * 1099511628211ull;
       image_actual_hash =
          (image_actual_hash ^ actual_bytes[i]) * 1099511628211ull;
    }
-   if (std::memcmp(checkerboard.data(), dst_map, image_size) != 0) {
+   if (std::memcmp(transfer_expected.data(), dst_map, image_buffer_size) != 0) {
       VkDeviceSize first = 0;
-      while (first < image_size && checkerboard[first] == actual_bytes[first])
+      while (first < image_buffer_size &&
+             transfer_expected[first] == actual_bytes[first])
          ++first;
       LOGE("image-transfer[%s]: FAIL byte=%llu expected=%02x actual=%02x "
            "expected_hash=%016llx actual_hash=%016llx",
-           label, static_cast<unsigned long long>(first), checkerboard[first],
-           actual_bytes[first],
+           label, static_cast<unsigned long long>(first),
+           transfer_expected[first], actual_bytes[first],
            static_cast<unsigned long long>(image_expected_hash),
            static_cast<unsigned long long>(image_actual_hash));
       cleanup();
       return false;
    }
-   LOGI("image-transfer[%s]: PASS extent=8x8 hash=%016llx", label,
+   LOGI("image-transfer[%s]: PASS extent=31x29 rowLength=32 imageHeight=30 "
+        "layers=2 hash=%016llx",
+        label,
         static_cast<unsigned long long>(image_actual_hash));
 
    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -948,12 +985,14 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    view_info.format = image_format;
    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
    view_info.subresourceRange.levelCount = 1;
+   view_info.subresourceRange.baseArrayLayer = 1;
    view_info.subresourceRange.layerCount = 1;
    view_info.image = sampled_image;
    result = CreateImageView(device, &view_info, nullptr, &sampled_image_view);
    if (result != VK_SUCCESS)
       return failed("sample vkCreateImageView(source)", result);
    view_info.image = output_image;
+   view_info.subresourceRange.baseArrayLayer = 0;
    result = CreateImageView(device, &view_info, nullptr, &output_image_view);
    if (result != VK_SUCCESS)
       return failed("sample vkCreateImageView(output)", result);
@@ -1119,7 +1158,18 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    result = AllocateCommandBuffers(device, &command_info, &sample_command);
    if (result != VK_SUCCESS)
       return failed("sample vkAllocateCommandBuffers", result);
-   std::memset(dst_map, 0x5a, image_size);
+   constexpr uint8_t sample_sentinel = 0x3c;
+   std::array<uint8_t, image_buffer_size> sample_expected{};
+   sample_expected.fill(sample_sentinel);
+   for (uint32_t y = 0; y < image_height; ++y) {
+      for (uint32_t x = 0; x < image_width; ++x) {
+         const size_t source_offset = layer_pitch + y * row_pitch + x * 4;
+         const size_t output_offset = y * row_pitch + x * 4;
+         std::memcpy(sample_expected.data() + output_offset,
+                     upload.data() + source_offset, 4);
+      }
+   }
+   std::memset(dst_map, sample_sentinel, image_buffer_size);
    if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
       VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
       range.memory = dst_memory;
@@ -1138,7 +1188,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
        VK_QUEUE_FAMILY_IGNORED, sampled_image,
-       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, 1}},
       {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
@@ -1176,9 +1226,16 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                       nullptr, 1, &output_barrier);
+   VkBufferImageCopy sample_copy{};
+   sample_copy.bufferRowLength = buffer_row_length;
+   sample_copy.bufferImageHeight = buffer_image_height;
+   sample_copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   sample_copy.imageSubresource.baseArrayLayer = 0;
+   sample_copy.imageSubresource.layerCount = 1;
+   sample_copy.imageExtent = {image_width, image_height, 1};
    CmdCopyImageToBuffer(sample_command, output_image,
                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1,
-                        &image_copy);
+                        &sample_copy);
    CmdPipelineBarrier(sample_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
                       &transfer_host_barrier, 0, nullptr);
@@ -1201,24 +1258,31 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          return failed("sample vkInvalidateMappedMemoryRanges", result);
    }
 
+   uint64_t sample_expected_hash = 1469598103934665603ull;
    uint64_t sample_actual_hash = 1469598103934665603ull;
-   for (VkDeviceSize i = 0; i < image_size; ++i)
+   for (VkDeviceSize i = 0; i < image_buffer_size; ++i) {
+      sample_expected_hash =
+         (sample_expected_hash ^ sample_expected[i]) * 1099511628211ull;
       sample_actual_hash =
          (sample_actual_hash ^ actual_bytes[i]) * 1099511628211ull;
-   if (std::memcmp(checkerboard.data(), dst_map, image_size) != 0) {
+   }
+   if (std::memcmp(sample_expected.data(), dst_map, image_buffer_size) != 0) {
       VkDeviceSize first = 0;
-      while (first < image_size && checkerboard[first] == actual_bytes[first])
+      while (first < image_buffer_size &&
+             sample_expected[first] == actual_bytes[first])
          ++first;
       LOGE("sample[%s]: FAIL byte=%llu expected=%02x actual=%02x "
            "expected_hash=%016llx actual_hash=%016llx",
-           label, static_cast<unsigned long long>(first), checkerboard[first],
-           actual_bytes[first],
-           static_cast<unsigned long long>(image_expected_hash),
+           label, static_cast<unsigned long long>(first),
+           sample_expected[first], actual_bytes[first],
+           static_cast<unsigned long long>(sample_expected_hash),
            static_cast<unsigned long long>(sample_actual_hash));
       cleanup();
       return false;
    }
-   LOGI("sample[%s]: PASS extent=8x8 hash=%016llx", label,
+   LOGI("sample[%s]: PASS extent=31x29 rowLength=32 imageHeight=30 "
+        "sourceLayer=1 hash=%016llx",
+        label,
         static_cast<unsigned long long>(sample_actual_hash));
    cleanup();
    return true;

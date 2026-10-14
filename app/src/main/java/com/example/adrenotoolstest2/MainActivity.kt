@@ -6,6 +6,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -16,12 +17,16 @@ import kotlin.math.roundToInt
 
 class MainActivity : GameActivity() {
     companion object {
+        private val PANVK_JM_FAULT_PATTERN =
+            Regex("^[A-Za-z0-9._-]+:(submit-eio|ppoll-eio|ppoll-timeout|read-eio|done-failure)(:[1-9][0-9]*)?$")
+
         init {
             System.loadLibrary("adrenotoolstest2")
         }
     }
 
     private external fun nativeStats(): String
+    private external fun nativeSetPanvkJmFault(selector: String?): Boolean
 
     private lateinit var statsView: TextView
     private val statsHandler = Handler(Looper.getMainLooper())
@@ -33,6 +38,14 @@ class MainActivity : GameActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val selector = intent?.getStringExtra("panvk_jm_fault")
+        val validSelector = selector == null || PANVK_JM_FAULT_PATTERN.matches(selector)
+        if (!validSelector) {
+            nativeSetPanvkJmFault(null)
+            Log.e("PanvkFaultProbe", "PANVK_JM_FAULT selector rejected")
+        } else if (!nativeSetPanvkJmFault(selector)) {
+            Log.e("PanvkFaultProbe", "PANVK_JM_FAULT selector rejected")
+        }
         super.onCreate(savedInstanceState)
 
         val density = resources.displayMetrics.density

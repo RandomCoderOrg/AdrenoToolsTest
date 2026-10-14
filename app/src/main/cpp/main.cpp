@@ -7,7 +7,11 @@
 
 #include <sys/stat.h>
 
+#include <climits>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #define VK_NO_PROTOTYPES
 #include <dlfcn.h>
@@ -16,6 +20,71 @@
 #include "panvk_present.h"
 
 static void *gVulkan = nullptr;
+static bool gFaultProbe = false;
+
+static bool validPanvkJmFaultSelector( const char *selector )
+{
+	if( !selector || !selector[0] )
+		return false;
+	const char *modeSeparator = std::strchr( selector, ':' );
+	if( !modeSeparator || modeSeparator == selector || modeSeparator - selector >= 64 )
+		return false;
+	for( const char *c = selector; c != modeSeparator; ++c )
+	{
+		if( !( ( *c >= 'A' && *c <= 'Z' ) || ( *c >= 'a' && *c <= 'z' ) ||
+			   ( *c >= '0' && *c <= '9' ) || *c == '.' || *c == '_' || *c == '-' ) )
+			return false;
+	}
+	const char *countSeparator = std::strchr( modeSeparator + 1, ':' );
+	const size_t modeLength = countSeparator ? static_cast<size_t>( countSeparator - modeSeparator - 1 )
+										 : std::strlen( modeSeparator + 1 );
+	static const char *modes[] = { "submit-eio", "ppoll-eio", "ppoll-timeout", "read-eio",
+								 "done-failure" };
+	bool validMode = false;
+	for( const char *mode : modes )
+	{
+		if( std::strlen( mode ) == modeLength &&
+			std::memcmp( modeSeparator + 1, mode, modeLength ) == 0 )
+		{
+			validMode = true;
+			break;
+		}
+	}
+	if( !validMode )
+		return false;
+	if( !countSeparator )
+		return true;
+	if( !countSeparator[1] )
+		return false;
+	for( const char *c = countSeparator + 1; *c; ++c )
+	{
+		if( *c < '0' || *c > '9' )
+			return false;
+	}
+	char *end = nullptr;
+	const unsigned long target = std::strtoul( countSeparator + 1, &end, 10 );
+	return end != countSeparator + 1 && !*end && target > 0 && target <= UINT_MAX;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_adrenotoolstest2_MainActivity_nativeSetPanvkJmFault( JNIEnv *env, jobject,
+															   jstring selector )
+{
+	if( !selector )
+	{
+		unsetenv( "PANVK_JM_FAULT" );
+		return JNI_TRUE;
+	}
+	const char *value = env->GetStringUTFChars( selector, nullptr );
+	if( !value )
+		return JNI_FALSE;
+	const bool valid = validPanvkJmFaultSelector( value );
+	const bool stored = valid && setenv( "PANVK_JM_FAULT", value, 1 ) == 0;
+	env->ReleaseStringUTFChars( selector, value );
+	if( !stored )
+		unsetenv( "PANVK_JM_FAULT" );
+	return stored ? JNI_TRUE : JNI_FALSE;
+}
 
 /** Copies a file from one folder into another. Dst folder must exist.
 	e.g.
@@ -254,7 +323,7 @@ void handle_cmd( android_app *pApp, int32_t cmd )
 		// "game" class if that suits your needs. Remember to change all instances of userData
 		// if you change the class here as a reinterpret_cast is dangerous this in the
 		// android_main function and the APP_CMD_TERM_WINDOW handler case.
-		if( gVulkan && pApp->window )
+		if( !gFaultProbe && gVulkan && pApp->window )
 			panvk_present_init( gVulkan, pApp->window );
 		break;
 	case APP_CMD_TERM_WINDOW:
@@ -347,11 +416,13 @@ void android_main( struct android_app *pApp )
 	}
 #endif
 
-	loadOriginalVulkan();
+	gFaultProbe = std::getenv( "PANVK_JM_FAULT" ) != nullptr;
+	if( !gFaultProbe )
+		loadOriginalVulkan();
 	copyFile( srcFolder, dstFolder, vulkanLibName );
 	setenv( "PANVK_KBASE_FENCE_TRACE", "1", 1 );
 	gVulkan = replaceDriver( dstFolder, nativeLibraryDir.c_str(), vulkanLibName );
-	if( gVulkan && pApp->window )
+	if( !gFaultProbe && gVulkan && pApp->window )
 		panvk_present_init( gVulkan, pApp->window );
 
 	// Register an event handler for Android events
@@ -375,7 +446,8 @@ void android_main( struct android_app *pApp )
 				pSource->process( pApp, pSource );
 			}
 		}
-		panvk_present_draw();
+		if( !gFaultProbe )
+			panvk_present_draw();
 	} while( !pApp->destroyRequested );
 	panvk_present_shutdown();
 }

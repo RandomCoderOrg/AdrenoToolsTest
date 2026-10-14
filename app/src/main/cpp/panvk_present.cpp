@@ -162,10 +162,108 @@ bool check(VkResult result, const char *operation)
    LOGE("%s failed: %d", operation, result);
    return false;
 }
+
+struct JmFaultSelector {
+   bool requested{};
+   bool valid{};
+   std::string run_id;
+   std::string mode;
+};
+
+JmFaultSelector read_jm_fault_selector(const char *label)
+{
+   JmFaultSelector parsed;
+   const char *selector = std::getenv("PANVK_JM_FAULT");
+   parsed.requested = selector && !std::strcmp(label, "panvk");
+   if (!parsed.requested)
+      return parsed;
+
+   const char *mode_separator = std::strchr(selector, ':');
+   if (!mode_separator || mode_separator == selector ||
+       mode_separator - selector >= 64)
+      return parsed;
+   for (const char *c = selector; c != mode_separator; ++c) {
+      if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+            (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' ||
+            *c == '-'))
+         return parsed;
+   }
+
+   const char *count_separator = std::strchr(mode_separator + 1, ':');
+   const size_t mode_length =
+      count_separator ? static_cast<size_t>(count_separator - mode_separator - 1)
+                      : std::strlen(mode_separator + 1);
+   static constexpr const char *modes[] = {
+      "submit-eio", "ppoll-eio", "ppoll-timeout", "read-eio",
+      "done-failure",
+   };
+   const char *matched_mode = nullptr;
+   for (const char *mode : modes) {
+      if (std::strlen(mode) == mode_length &&
+          !std::memcmp(mode_separator + 1, mode, mode_length)) {
+         matched_mode = mode;
+         break;
+      }
+   }
+   if (!matched_mode)
+      return parsed;
+
+   if (count_separator) {
+      if (!count_separator[1])
+         return parsed;
+      for (const char *c = count_separator + 1; *c; ++c) {
+         if (*c < '0' || *c > '9')
+            return parsed;
+      }
+      char *end = nullptr;
+      const unsigned long count = std::strtoul(count_separator + 1, &end, 10);
+      if (end == count_separator + 1 || *end || count == 0 ||
+          count > UINT32_MAX)
+         return parsed;
+   }
+
+   parsed.run_id.assign(selector, mode_separator);
+   parsed.mode = matched_mode;
+   parsed.valid = true;
+   return parsed;
+}
 } // namespace
 
 bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
 {
+   const JmFaultSelector fault = read_jm_fault_selector(label);
+   constexpr int result_unobserved = 999999;
+   bool fault_result_emitted = false;
+   int fault_submit1 = result_unobserved;
+   int fault_wait1 = result_unobserved;
+   int fault_fence = result_unobserved;
+   int fault_recovery_wait = result_unobserved;
+   int fault_submit2 = result_unobserved;
+   int fault_wait2 = result_unobserved;
+   const char *fault_sentinel = "UNAVAILABLE";
+   uint64_t fault_expected_hash = 0;
+   uint64_t fault_actual_hash = 0;
+   auto emit_fault_result = [&](const char *outcome, const char *reason) {
+      if (!fault.requested || fault_result_emitted)
+         return;
+      const int priority = !std::strcmp(outcome, "PASS")
+                              ? ANDROID_LOG_INFO
+                              : (!std::strcmp(outcome, "FAIL")
+                                    ? ANDROID_LOG_ERROR
+                                    : ANDROID_LOG_WARN);
+      __android_log_print(
+         priority, "PanvkPresent",
+         "jm-fault-app: result=%s run=%s mode=%s submit1=%d wait1=%d "
+         "fence=%d recovery_wait=%d submit2=%d wait2=%d sentinel=%s "
+         "expected_hash=%016llx actual_hash=%016llx reason=%s",
+         outcome, fault.valid ? fault.run_id.c_str() : "invalid",
+         fault.valid ? fault.mode.c_str() : "invalid", fault_submit1,
+         fault_wait1, fault_fence, fault_recovery_wait, fault_submit2,
+         fault_wait2, fault_sentinel,
+         static_cast<unsigned long long>(fault_expected_hash),
+         static_cast<unsigned long long>(fault_actual_hash), reason);
+      fault_result_emitted = true;
+   };
    constexpr VkDeviceSize size = 4096;
    constexpr VkDeviceSize buffer_size = 8192;
    VkInstance instance{};
@@ -206,6 +304,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkPipeline indexed_pipeline{};
    VkPipeline blend_pipeline{};
    VkPipeline depth_pipeline{};
+   VkFence fault_fences[2]{};
    void *src_map{};
    void *dst_map{};
 
@@ -215,6 +314,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       dlsym(libvulkan, "vkCreateInstance"));
    if (!GetInstanceProcAddr || !CreateInstance) {
       LOGE("buffer-copy[%s]: loader entrypoints unavailable", label);
+      emit_fault_result("INCONCLUSIVE", "loader-entrypoints");
       return false;
    }
 
@@ -226,6 +326,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkResult result = CreateInstance(&instance_info, nullptr, &instance);
    if (result != VK_SUCCESS) {
       LOGE("buffer-copy[%s]: vkCreateInstance failed: %d", label, result);
+      emit_fault_result("INCONCLUSIVE", "create-instance");
       return false;
    }
 
@@ -251,6 +352,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       LOGE("buffer-copy[%s]: instance entrypoints unavailable", label);
       if (DestroyInstance)
          DestroyInstance(instance, nullptr);
+      emit_fault_result("INCONCLUSIVE", "instance-entrypoints");
       return false;
    }
 
@@ -263,6 +365,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    if (result != VK_SUCCESS || physical_count == 0) {
       LOGE("buffer-copy[%s]: no physical device: %d", label, result);
       DestroyInstance(instance, nullptr);
+      emit_fault_result("INCONCLUSIVE", "physical-device");
       return false;
    }
    VkPhysicalDevice physical = physical_devices[0];
@@ -285,6 +388,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    if (queue_family == UINT32_MAX) {
       LOGI("buffer-copy[%s]: SKIP unsupported graphics+compute queue", label);
       DestroyInstance(instance, nullptr);
+      emit_fault_result("INCONCLUSIVE", "queue-family");
       return false;
    }
 
@@ -300,6 +404,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    if (result != VK_SUCCESS) {
       LOGE("buffer-copy[%s]: vkCreateDevice failed: %d", label, result);
       DestroyInstance(instance, nullptr);
+      emit_fault_result("INCONCLUSIVE", "create-device");
       return false;
    }
 
@@ -374,9 +479,12 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkDeviceWaitIdle, DeviceWaitIdle);
 #undef DEVICE_PROC
 
+   bool allow_fault_idle_cleanup = false;
    auto cleanup = [&]() {
-      if (device && DeviceWaitIdle)
-         DeviceWaitIdle(device);
+      bool idle_ok = true;
+      if (device && DeviceWaitIdle &&
+          (!fault.requested || allow_fault_idle_cleanup))
+         idle_ok = DeviceWaitIdle(device) == VK_SUCCESS;
       if (src_map && UnmapMemory)
          UnmapMemory(device, src_memory);
       if (dst_map && UnmapMemory)
@@ -443,6 +551,10 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          DestroyDescriptorPool(device, descriptor_pool, nullptr);
       if (descriptor_layout && DestroyDescriptorSetLayout)
          DestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+      for (VkFence fence : fault_fences) {
+         if (fence && DestroyFence)
+            DestroyFence(device, fence, nullptr);
+      }
       if (pool && DestroyCommandPool)
          DestroyCommandPool(device, pool, nullptr);
       if (src && DestroyBuffer)
@@ -456,9 +568,11 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       if (device && DestroyDevice)
          DestroyDevice(device, nullptr);
       DestroyInstance(instance, nullptr);
+      return idle_ok;
    };
    auto failed = [&](const char *operation, VkResult failure) {
       LOGE("buffer-copy[%s]: %s failed: %d", label, operation, failure);
+      emit_fault_result("INCONCLUSIVE", "setup");
       cleanup();
       return false;
    };
@@ -490,6 +604,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !DestroySemaphore || !GetFenceStatus || !ResetFences ||
        !WaitForFences || !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
+      emit_fault_result("INCONCLUSIVE", "device-entrypoints");
       cleanup();
       return false;
    }
@@ -541,6 +656,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    }
    if (memory_type == UINT32_MAX) {
       LOGE("buffer-copy[%s]: no common host-visible memory type", label);
+      emit_fault_result("INCONCLUSIVE", "memory-type");
       cleanup();
       return false;
    }
@@ -592,29 +708,178 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    result = CreateCommandPool(device, &pool_info, nullptr, &pool);
    if (result != VK_SUCCESS)
       return failed("vkCreateCommandPool", result);
-   VkCommandBuffer command{};
+   VkCommandBuffer commands[2]{};
    VkCommandBufferAllocateInfo command_info{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
    command_info.commandPool = pool;
    command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-   command_info.commandBufferCount = 1;
-   result = AllocateCommandBuffers(device, &command_info, &command);
+   command_info.commandBufferCount = fault.requested ? 2 : 1;
+   result = AllocateCommandBuffers(device, &command_info, commands);
    if (result != VK_SUCCESS)
       return failed("vkAllocateCommandBuffers", result);
+   command_info.commandBufferCount = 1;
    VkCommandBufferBeginInfo begin_info{
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-   result = BeginCommandBuffer(command, &begin_info);
-   if (result != VK_SUCCESS)
-      return failed("vkBeginCommandBuffer", result);
    VkBufferCopy copy{0, 0, size};
-   CmdCopyBuffer(command, src, dst, 1, &copy);
-   result = EndCommandBuffer(command);
-   if (result != VK_SUCCESS)
-      return failed("vkEndCommandBuffer", result);
+   for (uint32_t i = 0; i < (fault.requested ? 2u : 1u); ++i) {
+      result = BeginCommandBuffer(commands[i], &begin_info);
+      if (result != VK_SUCCESS)
+         return failed("vkBeginCommandBuffer", result);
+      CmdCopyBuffer(commands[i], src, dst, 1, &copy);
+      result = EndCommandBuffer(commands[i]);
+      if (result != VK_SUCCESS)
+         return failed("vkEndCommandBuffer", result);
+   }
+   VkCommandBuffer command = commands[0];
    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
    submit.commandBufferCount = 1;
    submit.pCommandBuffers = &command;
+
+   if (fault.requested) {
+      if (!fault.valid) {
+         emit_fault_result("INCONCLUSIVE", "invalid-selector");
+         cleanup();
+         return false;
+      }
+
+      VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      for (VkFence &fence : fault_fences) {
+         result = CreateFence(device, &fence_info, nullptr, &fence);
+         if (result != VK_SUCCESS)
+            return failed("jm-fault vkCreateFence", result);
+      }
+
+      constexpr uint64_t short_wait_ns = 50ull * 1000 * 1000;
+      constexpr uint64_t recovery_wait_ns = 5ull * 1000 * 1000 * 1000;
+      const auto hash_bytes = [](const uint8_t *bytes, VkDeviceSize count) {
+         uint64_t hash = 1469598103934665603ull;
+         for (VkDeviceSize i = 0; i < count; ++i)
+            hash = (hash ^ bytes[i]) * 1099511628211ull;
+         return hash;
+      };
+      std::array<uint8_t, size> sentinel{};
+      sentinel.fill(0x5a);
+      const auto *expected_bytes =
+         reinterpret_cast<const uint8_t *>(expected.data());
+      const auto *actual_bytes = reinterpret_cast<const uint8_t *>(dst_map);
+      fault_expected_hash = hash_bytes(expected_bytes, size);
+      const auto classify_output = [&]() {
+         fault_actual_hash = hash_bytes(actual_bytes, size);
+         if (!std::memcmp(actual_bytes, expected_bytes, size))
+            fault_sentinel = "EXPECTED";
+         else if (!std::memcmp(actual_bytes, sentinel.data(), size))
+            fault_sentinel = "UNCHANGED";
+         else
+            fault_sentinel = "OTHER";
+      };
+      const auto invalidate_output = [&]() {
+         if (memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            return VK_SUCCESS;
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = dst_memory;
+         range.size = VK_WHOLE_SIZE;
+         return InvalidateMappedMemoryRanges(device, 1, &range);
+      };
+
+      fault_submit1 = QueueSubmit(queue, 1, &submit, fault_fences[0]);
+      if (fault.mode == "submit-eio") {
+         fault_fence = GetFenceStatus(device, fault_fences[0]);
+         fault_wait1 = WaitForFences(device, 1, &fault_fences[0], VK_TRUE,
+                                     short_wait_ns);
+         submit.pCommandBuffers = &commands[1];
+         fault_submit2 = QueueSubmit(queue, 1, &submit, fault_fences[1]);
+         fault_wait2 = WaitForFences(device, 1, &fault_fences[1], VK_TRUE,
+                                     short_wait_ns);
+         classify_output();
+         const bool pass = fault_submit1 == VK_ERROR_DEVICE_LOST &&
+                           fault_wait1 == VK_ERROR_DEVICE_LOST &&
+                           fault_fence == VK_ERROR_DEVICE_LOST &&
+                           fault_submit2 == VK_ERROR_DEVICE_LOST &&
+                           fault_wait2 == VK_ERROR_DEVICE_LOST &&
+                           !std::strcmp(fault_sentinel, "UNCHANGED");
+         emit_fault_result(pass ? "PASS" : "FAIL",
+                           pass ? "expected-device-loss" : "contract");
+         return pass;
+      }
+
+      if (fault_submit1 != VK_SUCCESS) {
+         emit_fault_result("FAIL", "first-submit");
+         return false;
+      }
+
+      if (fault.mode == "ppoll-timeout") {
+         fault_wait1 = WaitForFences(device, 1, &fault_fences[0], VK_TRUE,
+                                     short_wait_ns);
+         fault_fence = GetFenceStatus(device, fault_fences[0]);
+         fault_recovery_wait = WaitForFences(
+            device, 1, &fault_fences[0], VK_TRUE, recovery_wait_ns);
+         bool first_hash_valid = false;
+         if (fault_recovery_wait == VK_SUCCESS) {
+            result = invalidate_output();
+            first_hash_valid =
+               result == VK_SUCCESS &&
+               !std::memcmp(expected.data(), dst_map, size);
+         }
+
+         if (first_hash_valid) {
+            std::memset(dst_map, 0x5a, size);
+            if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+               VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+               range.memory = dst_memory;
+               range.size = VK_WHOLE_SIZE;
+               result = FlushMappedMemoryRanges(device, 1, &range);
+            }
+            if (result == VK_SUCCESS) {
+               submit.pCommandBuffers = &commands[1];
+               fault_submit2 =
+                  QueueSubmit(queue, 1, &submit, fault_fences[1]);
+            }
+         }
+         if (fault_submit2 == VK_SUCCESS)
+            fault_wait2 = WaitForFences(device, 1, &fault_fences[1], VK_TRUE,
+                                        recovery_wait_ns);
+         if (fault_wait2 == VK_SUCCESS) {
+            result = invalidate_output();
+            if (result == VK_SUCCESS)
+               classify_output();
+         }
+         const bool fence_usable = fault_fence == VK_NOT_READY ||
+                                   fault_fence == VK_SUCCESS;
+         const bool pass = fault_wait1 == VK_TIMEOUT && fence_usable &&
+                           fault_recovery_wait == VK_SUCCESS &&
+                           first_hash_valid &&
+                           fault_submit2 == VK_SUCCESS &&
+                           fault_wait2 == VK_SUCCESS && result == VK_SUCCESS &&
+                           !std::strcmp(fault_sentinel, "EXPECTED");
+         if (pass) {
+            allow_fault_idle_cleanup = true;
+            const bool cleanup_ok = cleanup();
+            emit_fault_result(cleanup_ok ? "PASS" : "FAIL",
+                              cleanup_ok ? "timeout-recovered"
+                                         : "cleanup");
+            return cleanup_ok;
+         }
+         emit_fault_result("FAIL", "contract");
+         return false;
+      }
+
+      fault_wait1 = WaitForFences(device, 1, &fault_fences[0], VK_TRUE,
+                                  recovery_wait_ns);
+      fault_fence = GetFenceStatus(device, fault_fences[0]);
+      submit.pCommandBuffers = &commands[1];
+      fault_submit2 = QueueSubmit(queue, 1, &submit, fault_fences[1]);
+      fault_wait2 = WaitForFences(device, 1, &fault_fences[1], VK_TRUE,
+                                  short_wait_ns);
+      const bool pass = fault_wait1 == VK_ERROR_DEVICE_LOST &&
+                        fault_fence == VK_ERROR_DEVICE_LOST &&
+                        fault_submit2 == VK_ERROR_DEVICE_LOST &&
+                        fault_wait2 == VK_ERROR_DEVICE_LOST;
+      emit_fault_result(pass ? "PASS" : "FAIL",
+                        pass ? "expected-device-loss" : "contract");
+      return pass;
+   }
+
    result = QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
    if (result != VK_SUCCESS)
       return failed("vkQueueSubmit", result);

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <vector>
 
+#include "panvk_compute_spv.h"
 #include "panvk_triangle_frag_spv.h"
 #include "panvk_triangle_vert_spv.h"
 
@@ -114,6 +115,11 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkDeviceMemory src_memory{};
    VkDeviceMemory dst_memory{};
    VkCommandPool pool{};
+   VkDescriptorSetLayout descriptor_layout{};
+   VkDescriptorPool descriptor_pool{};
+   VkShaderModule compute_shader{};
+   VkPipelineLayout compute_pipeline_layout{};
+   VkPipeline compute_pipeline{};
    void *src_map{};
    void *dst_map{};
 
@@ -180,15 +186,13 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    uint32_t queue_family = UINT32_MAX;
    for (uint32_t i = 0; i < family_count; ++i) {
       if (families[i].queueCount &&
-          (families[i].queueFlags & (VK_QUEUE_TRANSFER_BIT |
-                                     VK_QUEUE_COMPUTE_BIT |
-                                     VK_QUEUE_GRAPHICS_BIT))) {
+          (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
          queue_family = i;
          break;
       }
    }
    if (queue_family == UINT32_MAX) {
-      LOGE("buffer-copy[%s]: no transfer-capable queue", label);
+      LOGE("buffer-copy[%s]: no compute-capable queue", label);
       DestroyInstance(instance, nullptr);
       return false;
    }
@@ -227,6 +231,22 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkAllocateCommandBuffers, AllocateCommandBuffers);
    DEVICE_PROC(PFN_vkBeginCommandBuffer, BeginCommandBuffer);
    DEVICE_PROC(PFN_vkCmdCopyBuffer, CmdCopyBuffer);
+   DEVICE_PROC(PFN_vkCreateDescriptorSetLayout, CreateDescriptorSetLayout);
+   DEVICE_PROC(PFN_vkDestroyDescriptorSetLayout, DestroyDescriptorSetLayout);
+   DEVICE_PROC(PFN_vkCreateDescriptorPool, CreateDescriptorPool);
+   DEVICE_PROC(PFN_vkDestroyDescriptorPool, DestroyDescriptorPool);
+   DEVICE_PROC(PFN_vkAllocateDescriptorSets, AllocateDescriptorSets);
+   DEVICE_PROC(PFN_vkUpdateDescriptorSets, UpdateDescriptorSets);
+   DEVICE_PROC(PFN_vkCreateShaderModule, CreateShaderModule);
+   DEVICE_PROC(PFN_vkDestroyShaderModule, DestroyShaderModule);
+   DEVICE_PROC(PFN_vkCreatePipelineLayout, CreatePipelineLayout);
+   DEVICE_PROC(PFN_vkDestroyPipelineLayout, DestroyPipelineLayout);
+   DEVICE_PROC(PFN_vkCreateComputePipelines, CreateComputePipelines);
+   DEVICE_PROC(PFN_vkDestroyPipeline, DestroyPipeline);
+   DEVICE_PROC(PFN_vkCmdBindPipeline, CmdBindPipeline);
+   DEVICE_PROC(PFN_vkCmdBindDescriptorSets, CmdBindDescriptorSets);
+   DEVICE_PROC(PFN_vkCmdDispatch, CmdDispatch);
+   DEVICE_PROC(PFN_vkCmdPipelineBarrier, CmdPipelineBarrier);
    DEVICE_PROC(PFN_vkEndCommandBuffer, EndCommandBuffer);
    DEVICE_PROC(PFN_vkQueueSubmit, QueueSubmit);
    DEVICE_PROC(PFN_vkQueueWaitIdle, QueueWaitIdle);
@@ -240,6 +260,16 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          UnmapMemory(device, src_memory);
       if (dst_map && UnmapMemory)
          UnmapMemory(device, dst_memory);
+      if (compute_pipeline && DestroyPipeline)
+         DestroyPipeline(device, compute_pipeline, nullptr);
+      if (compute_pipeline_layout && DestroyPipelineLayout)
+         DestroyPipelineLayout(device, compute_pipeline_layout, nullptr);
+      if (compute_shader && DestroyShaderModule)
+         DestroyShaderModule(device, compute_shader, nullptr);
+      if (descriptor_pool && DestroyDescriptorPool)
+         DestroyDescriptorPool(device, descriptor_pool, nullptr);
+      if (descriptor_layout && DestroyDescriptorSetLayout)
+         DestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
       if (pool && DestroyCommandPool)
          DestroyCommandPool(device, pool, nullptr);
       if (src && DestroyBuffer)
@@ -265,7 +295,14 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !BindBufferMemory || !MapMemory || !UnmapMemory ||
        !FlushMappedMemoryRanges || !InvalidateMappedMemoryRanges ||
        !CreateCommandPool || !DestroyCommandPool || !AllocateCommandBuffers ||
-       !BeginCommandBuffer || !CmdCopyBuffer || !EndCommandBuffer ||
+       !BeginCommandBuffer || !CmdCopyBuffer || !CreateDescriptorSetLayout ||
+       !DestroyDescriptorSetLayout || !CreateDescriptorPool ||
+       !DestroyDescriptorPool || !AllocateDescriptorSets ||
+       !UpdateDescriptorSets || !CreateShaderModule || !DestroyShaderModule ||
+       !CreatePipelineLayout || !DestroyPipelineLayout ||
+       !CreateComputePipelines || !DestroyPipeline || !CmdBindPipeline ||
+       !CmdBindDescriptorSets || !CmdDispatch || !CmdPipelineBarrier ||
+       !EndCommandBuffer ||
        !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
       cleanup();
@@ -281,7 +318,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    result = CreateBuffer(device, &buffer_info, nullptr, &src);
    if (result != VK_SUCCESS)
       return failed("vkCreateBuffer(src)", result);
-   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
    result = CreateBuffer(device, &buffer_info, nullptr, &dst);
    if (result != VK_SUCCESS)
       return failed("vkCreateBuffer(dst)", result);
@@ -431,6 +469,174 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    LOGI("buffer-copy[%s]: PASS bytes=%llu hash=%016llx memory_type=%u flags=0x%x",
         label, static_cast<unsigned long long>(size),
         static_cast<unsigned long long>(actual_hash), memory_type, memory_flags);
+
+   std::array<uint32_t, size / sizeof(uint32_t)> compute_expected{};
+   for (uint32_t i = 0; i < compute_expected.size(); ++i)
+      compute_expected[i] = (0x045d9f3bu * (i + 3u)) ^ 0xc001d00du;
+   std::memset(dst_map, 0, size);
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("compute vkFlushMappedMemoryRanges", result);
+   }
+
+   VkDescriptorSetLayoutBinding descriptor_binding{};
+   descriptor_binding.binding = 0;
+   descriptor_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   descriptor_binding.descriptorCount = 1;
+   descriptor_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+   VkDescriptorSetLayoutCreateInfo descriptor_layout_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+   descriptor_layout_info.bindingCount = 1;
+   descriptor_layout_info.pBindings = &descriptor_binding;
+   result = CreateDescriptorSetLayout(device, &descriptor_layout_info, nullptr,
+                                      &descriptor_layout);
+   if (result != VK_SUCCESS)
+      return failed("compute vkCreateDescriptorSetLayout", result);
+
+   VkDescriptorPoolSize descriptor_pool_size{
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+   VkDescriptorPoolCreateInfo descriptor_pool_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+   descriptor_pool_info.maxSets = 1;
+   descriptor_pool_info.poolSizeCount = 1;
+   descriptor_pool_info.pPoolSizes = &descriptor_pool_size;
+   result = CreateDescriptorPool(device, &descriptor_pool_info, nullptr,
+                                 &descriptor_pool);
+   if (result != VK_SUCCESS)
+      return failed("compute vkCreateDescriptorPool", result);
+
+   VkDescriptorSet descriptor_set{};
+   VkDescriptorSetAllocateInfo descriptor_allocate_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+   descriptor_allocate_info.descriptorPool = descriptor_pool;
+   descriptor_allocate_info.descriptorSetCount = 1;
+   descriptor_allocate_info.pSetLayouts = &descriptor_layout;
+   result = AllocateDescriptorSets(device, &descriptor_allocate_info,
+                                   &descriptor_set);
+   if (result != VK_SUCCESS)
+      return failed("compute vkAllocateDescriptorSets", result);
+
+   VkDescriptorBufferInfo descriptor_buffer{dst, 0, size};
+   VkWriteDescriptorSet descriptor_write{
+      VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+   descriptor_write.dstSet = descriptor_set;
+   descriptor_write.dstBinding = 0;
+   descriptor_write.descriptorCount = 1;
+   descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   descriptor_write.pBufferInfo = &descriptor_buffer;
+   UpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
+
+   VkShaderModuleCreateInfo shader_info{
+      VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+   shader_info.codeSize = sizeof(panvk_compute_spv);
+   shader_info.pCode = panvk_compute_spv;
+   result = CreateShaderModule(device, &shader_info, nullptr, &compute_shader);
+   if (result != VK_SUCCESS)
+      return failed("compute vkCreateShaderModule", result);
+
+   VkPipelineLayoutCreateInfo pipeline_layout_info{
+      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   pipeline_layout_info.setLayoutCount = 1;
+   pipeline_layout_info.pSetLayouts = &descriptor_layout;
+   result = CreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &compute_pipeline_layout);
+   if (result != VK_SUCCESS)
+      return failed("compute vkCreatePipelineLayout", result);
+
+   VkPipelineShaderStageCreateInfo shader_stage{
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+   shader_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+   shader_stage.module = compute_shader;
+   shader_stage.pName = "main";
+   VkComputePipelineCreateInfo compute_pipeline_info{
+      VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+   compute_pipeline_info.stage = shader_stage;
+   compute_pipeline_info.layout = compute_pipeline_layout;
+   result = CreateComputePipelines(device, VK_NULL_HANDLE, 1,
+                                   &compute_pipeline_info, nullptr,
+                                   &compute_pipeline);
+   if (result != VK_SUCCESS)
+      return failed("compute vkCreateComputePipelines", result);
+
+   VkCommandBuffer compute_command{};
+   result = AllocateCommandBuffers(device, &command_info, &compute_command);
+   if (result != VK_SUCCESS)
+      return failed("compute vkAllocateCommandBuffers", result);
+   result = BeginCommandBuffer(compute_command, &begin_info);
+   if (result != VK_SUCCESS)
+      return failed("compute vkBeginCommandBuffer", result);
+   CmdBindPipeline(compute_command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                   compute_pipeline);
+   CmdBindDescriptorSets(compute_command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                         compute_pipeline_layout, 0, 1, &descriptor_set, 0,
+                         nullptr);
+   CmdDispatch(compute_command, compute_expected.size() / 64, 1, 1);
+   VkBufferMemoryBarrier host_barrier{
+      VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+   host_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+   host_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+   host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   host_barrier.buffer = dst;
+   host_barrier.size = size;
+   CmdPipelineBarrier(compute_command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                      &host_barrier, 0, nullptr);
+   result = EndCommandBuffer(compute_command);
+   if (result != VK_SUCCESS)
+      return failed("compute vkEndCommandBuffer", result);
+   submit.pCommandBuffers = &compute_command;
+   result = QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+   if (result != VK_SUCCESS)
+      return failed("compute vkQueueSubmit", result);
+   result = QueueWaitIdle(queue);
+   if (result != VK_SUCCESS)
+      return failed("compute vkQueueWaitIdle", result);
+
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = dst_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = InvalidateMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("compute vkInvalidateMappedMemoryRanges", result);
+   }
+
+   uint64_t compute_expected_hash = 1469598103934665603ull;
+   uint64_t compute_actual_hash = 1469598103934665603ull;
+   const auto *compute_expected_bytes =
+      reinterpret_cast<const uint8_t *>(compute_expected.data());
+   for (VkDeviceSize i = 0; i < size; ++i) {
+      compute_expected_hash =
+         (compute_expected_hash ^ compute_expected_bytes[i]) *
+         1099511628211ull;
+      compute_actual_hash = (compute_actual_hash ^ actual_bytes[i]) *
+                            1099511628211ull;
+   }
+   if (std::memcmp(compute_expected.data(), dst_map, size) != 0) {
+      VkDeviceSize first = 0;
+      while (first < size &&
+             compute_expected_bytes[first] == actual_bytes[first])
+         ++first;
+      LOGE("compute[%s]: FAIL byte=%llu expected=%02x actual=%02x "
+           "expected_hash=%016llx actual_hash=%016llx",
+           label, static_cast<unsigned long long>(first),
+           compute_expected_bytes[first], actual_bytes[first],
+           static_cast<unsigned long long>(compute_expected_hash),
+           static_cast<unsigned long long>(compute_actual_hash));
+      cleanup();
+      return false;
+   }
+
+   LOGI("compute[%s]: PASS invocations=%zu hash=%016llx memory_type=%u "
+        "flags=0x%x",
+        label, compute_expected.size(),
+        static_cast<unsigned long long>(compute_actual_hash), memory_type,
+        memory_flags);
    cleanup();
    return true;
 }

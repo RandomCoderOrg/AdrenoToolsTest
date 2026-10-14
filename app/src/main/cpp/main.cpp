@@ -348,6 +348,8 @@ void android_main( struct android_app *pApp )
 	loadOriginalVulkan();
 	copyFile( srcFolder, dstFolder, vulkanLibName );
 	gVulkan = replaceDriver( dstFolder, nativeLibraryDir.c_str(), vulkanLibName );
+	if( gVulkan && pApp->window )
+		panvk_present_init( gVulkan, pApp->window );
 
 	// Register an event handler for Android events
 	pApp->onAppCmd = handle_cmd;

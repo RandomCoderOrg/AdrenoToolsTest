@@ -778,6 +778,11 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       constexpr uint32_t stamp_count = 4096;
       constexpr uint32_t wave_size = 256;
       constexpr uint32_t wave_count = stamp_count / wave_size;
+      constexpr uint32_t wave_warmup = 8;
+      constexpr uint32_t semaphore_cycles = 64;
+      constexpr uint32_t semaphore_interval = 8;
+      constexpr uint32_t semaphore_checkpoints =
+         semaphore_cycles / semaphore_interval - 1;
       constexpr uint32_t chain_size = 121;
       constexpr uint32_t stamp_sentinel = 0xcdcdcdcdu;
       constexpr uint32_t error_sentinel = 0xffffffffu;
@@ -858,6 +863,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          long maps = -1;
          long rss_kb = -1;
          long size_kb = -1;
+         uint64_t mapped_bytes = UINT64_MAX;
       };
       auto resource_snapshot = []() {
          ResourceSnapshot snapshot;
@@ -872,15 +878,27 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          }
          if (FILE *maps = std::fopen("/proc/self/maps", "r")) {
             snapshot.maps = 0;
-            int character = 0;
-            int last = '\n';
-            while ((character = std::fgetc(maps)) != EOF) {
-               if (character == '\n')
-                  ++snapshot.maps;
-               last = character;
-            }
-            if (last != '\n')
+            snapshot.mapped_bytes = 0;
+            bool valid = true;
+            char *line = nullptr;
+            size_t capacity = 0;
+            while (getline(&line, &capacity, maps) >= 0) {
+               unsigned long long start = 0;
+               unsigned long long end = 0;
                ++snapshot.maps;
+               if (std::sscanf(line, "%llx-%llx", &start, &end) != 2 ||
+                   end < start ||
+                   UINT64_MAX - snapshot.mapped_bytes < end - start) {
+                  valid = false;
+                  continue;
+               }
+               snapshot.mapped_bytes += end - start;
+            }
+            std::free(line);
+            if (std::ferror(maps) || !valid) {
+               snapshot.maps = -1;
+               snapshot.mapped_bytes = UINT64_MAX;
+            }
             std::fclose(maps);
          }
          if (FILE *status = std::fopen("/proc/self/status", "r")) {
@@ -893,7 +911,286 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          }
          return snapshot;
       };
-      const ResourceSnapshot resources_before = resource_snapshot();
+      auto snapshot_complete = [](const ResourceSnapshot &snapshot) {
+         return snapshot.fds >= 0 && snapshot.maps >= 0 &&
+                snapshot.rss_kb >= 0 && snapshot.size_kb >= 0 &&
+                snapshot.mapped_bytes != UINT64_MAX;
+      };
+      const bool resource_dut = std::strcmp(label, "panvk") == 0;
+      const char *resource_record =
+         resource_dut ? "RESOURCE_GATE" : "RESOURCE_CONTROL";
+      const char *resource_role = resource_dut ? "DUT" : "CONTROL";
+      const char *resource_policy = resource_dut ? "DUT" : "DIAGNOSTIC";
+      auto require_snapshot = [&](const char *phase, const char *checkpoint,
+                                  const ResourceSnapshot &snapshot) {
+         if (snapshot_complete(snapshot))
+            return true;
+         LOGE("jm-async[%s]: %s sampling=NON_COUNTING "
+              "result=NON_COUNTING gate=%s role=%s phase=%s "
+              "reason=invalid-snapshot "
+              "checkpoint=%s fd=%ld maps=%ld mapped_bytes=%llu "
+              "size_kb=%ld rss_kb=%ld",
+              label, resource_record, resource_policy, resource_role, phase,
+              checkpoint, snapshot.fds, snapshot.maps,
+              static_cast<unsigned long long>(snapshot.mapped_bytes),
+              snapshot.size_kb, snapshot.rss_kb);
+         return false;
+      };
+      auto resource_gate = [&](const char *phase, uint32_t warmup,
+                               uint32_t work_count, const char *work_unit,
+                               const ResourceSnapshot &baseline,
+                               const ResourceSnapshot *checkpoints,
+                               size_t checkpoint_count,
+                               size_t median_width,
+                               uint32_t first_checkpoint,
+                               uint32_t checkpoint_stride) {
+         if (!snapshot_complete(baseline) || !checkpoints ||
+             median_width == 0 || median_width > 4 ||
+             checkpoint_count < median_width * 2) {
+            LOGE("jm-async[%s]: %s sampling=NON_COUNTING "
+                 "result=NON_COUNTING gate=%s role=%s phase=%s "
+                 "reason=incomplete-work intervals=%zu median_width=%zu",
+                 label, resource_record, resource_policy, resource_role,
+                 phase, checkpoint_count, median_width);
+            return false;
+         }
+         for (size_t i = 0; i < checkpoint_count; ++i) {
+            if (!snapshot_complete(checkpoints[i])) {
+               char checkpoint[24];
+               std::snprintf(checkpoint, sizeof(checkpoint), "%u",
+                             first_checkpoint +
+                                static_cast<uint32_t>(i) * checkpoint_stride);
+               return require_snapshot(phase, checkpoint, checkpoints[i]);
+            }
+         }
+
+         enum class DriftClass {
+            stable,
+            bounded_drift,
+            inconclusive_late_drift,
+            growth,
+         };
+         struct DriftSummary {
+            DriftClass classification = DriftClass::stable;
+            size_t first_change_index = SIZE_MAX;
+            uint32_t transitions = 0;
+            size_t plateau_points = 0;
+         };
+         auto classify = [&](auto equal) {
+            DriftSummary summary;
+            size_t last_change_index = SIZE_MAX;
+            const ResourceSnapshot *previous = &baseline;
+            for (size_t i = 0; i < checkpoint_count; ++i) {
+               if (!equal(*previous, checkpoints[i])) {
+                  if (summary.first_change_index == SIZE_MAX)
+                     summary.first_change_index = i;
+                  last_change_index = i;
+                  ++summary.transitions;
+               }
+               previous = &checkpoints[i];
+            }
+            summary.plateau_points = summary.transitions == 0
+                                        ? checkpoint_count
+                                        : checkpoint_count -
+                                             last_change_index - 1;
+            if (summary.transitions == 0) {
+               summary.classification = DriftClass::stable;
+            } else if (summary.transitions == 1 &&
+                       summary.plateau_points >= 4) {
+               summary.classification = DriftClass::bounded_drift;
+            } else if (summary.transitions == 1) {
+               summary.classification =
+                  DriftClass::inconclusive_late_drift;
+            } else {
+               summary.classification = DriftClass::growth;
+            }
+            return summary;
+         };
+         auto class_name = [](DriftClass classification) {
+            switch (classification) {
+            case DriftClass::stable:
+               return "STABLE";
+            case DriftClass::bounded_drift:
+               return "BOUNDED_DRIFT";
+            case DriftClass::inconclusive_late_drift:
+               return "INCONCLUSIVE_LATE_DRIFT";
+            case DriftClass::growth:
+               return "GROWTH";
+            }
+            return "INCONCLUSIVE_LATE_DRIFT";
+         };
+         auto first_change_checkpoint = [&](const DriftSummary &summary) {
+            return summary.first_change_index == SIZE_MAX
+                      ? 0u
+                      : first_checkpoint +
+                           static_cast<uint32_t>(summary.first_change_index) *
+                              checkpoint_stride;
+         };
+         auto median = [&](size_t first, bool size_metric) {
+            std::array<long, 4> values{};
+            for (size_t i = 0; i < median_width; ++i) {
+               const ResourceSnapshot &snapshot = checkpoints[first + i];
+               values[i] = size_metric ? snapshot.size_kb : snapshot.rss_kb;
+            }
+            std::sort(values.begin(), values.begin() + median_width);
+            return median_width & 1
+                      ? values[median_width / 2]
+                      : (values[median_width / 2 - 1] +
+                         values[median_width / 2]) /
+                           2;
+         };
+
+         long fd_max = baseline.fds;
+         long maps_max = baseline.maps;
+         uint64_t mapped_bytes_max = baseline.mapped_bytes;
+         long size_min = baseline.size_kb;
+         long size_max = baseline.size_kb;
+         long rss_min = baseline.rss_kb;
+         long rss_max = baseline.rss_kb;
+         bool fd_stable = true;
+         bool maps_stable = true;
+         bool mapped_bytes_stable = true;
+         uint32_t size_positive_transitions = 0;
+         uint32_t size_positive_run = 0;
+         uint32_t size_max_positive_run = 0;
+         long previous_size = baseline.size_kb;
+         for (size_t i = 0; i < checkpoint_count; ++i) {
+            const ResourceSnapshot &snapshot = checkpoints[i];
+            fd_stable &= snapshot.fds == baseline.fds;
+            maps_stable &= snapshot.maps == baseline.maps;
+            mapped_bytes_stable &=
+               snapshot.mapped_bytes == baseline.mapped_bytes;
+            fd_max = std::max(fd_max, snapshot.fds);
+            maps_max = std::max(maps_max, snapshot.maps);
+            mapped_bytes_max =
+               std::max(mapped_bytes_max, snapshot.mapped_bytes);
+            size_min = std::min(size_min, snapshot.size_kb);
+            size_max = std::max(size_max, snapshot.size_kb);
+            rss_min = std::min(rss_min, snapshot.rss_kb);
+            rss_max = std::max(rss_max, snapshot.rss_kb);
+
+            if (snapshot.size_kb > previous_size)
+               ++size_positive_transitions;
+            size_positive_run = snapshot.size_kb > previous_size
+                                   ? size_positive_run + 1
+                                   : 0;
+            size_max_positive_run =
+               std::max(size_max_positive_run, size_positive_run);
+            previous_size = snapshot.size_kb;
+         }
+
+         const long first_size_median = median(0, true);
+         const long last_size_median =
+            median(checkpoint_count - median_width, true);
+         const long first_rss_median = median(0, false);
+         const long last_rss_median =
+            median(checkpoint_count - median_width, false);
+         const bool size_sustained_growth =
+            last_size_median - first_size_median > 1024 &&
+            size_max_positive_run >= 3;
+         const DriftSummary ownership = classify(
+            [](const ResourceSnapshot &left, const ResourceSnapshot &right) {
+               return left.fds == right.fds && left.maps == right.maps &&
+                      left.mapped_bytes == right.mapped_bytes;
+            });
+         const DriftSummary size = classify(
+            [](const ResourceSnapshot &left, const ResourceSnapshot &right) {
+               return left.size_kb == right.size_kb;
+            });
+         const DriftClass observed =
+            static_cast<unsigned>(ownership.classification) >=
+                  static_cast<unsigned>(size.classification)
+               ? ownership.classification
+               : size.classification;
+         const ResourceSnapshot &final = checkpoints[checkpoint_count - 1];
+         const bool ownership_drift = ownership.transitions != 0;
+         const bool size_net_upward =
+            final.size_kb > baseline.size_kb ||
+            last_size_median > first_size_median;
+         const bool size_growth =
+            size.classification == DriftClass::growth &&
+            ((size_positive_transitions >= 2 && size_net_upward) ||
+             size_sustained_growth);
+         bool accepted = true;
+         const char *dut_result = "PASS_STABLE";
+         if (ownership_drift) {
+            dut_result = "FAIL_OWNERSHIP_DRIFT";
+            accepted = false;
+         } else {
+            switch (size.classification) {
+            case DriftClass::stable:
+               dut_result = "PASS_STABLE";
+               break;
+            case DriftClass::bounded_drift:
+               dut_result = "PASS_BOUNDED_DRIFT";
+               break;
+            case DriftClass::inconclusive_late_drift:
+               dut_result = "INCONCLUSIVE_LATE_DRIFT";
+               accepted = false;
+               break;
+            case DriftClass::growth:
+               dut_result = size_growth ? "FAIL_GROWTH" : "PASS_NO_GROWTH";
+               accepted = !size_growth;
+               break;
+            }
+         }
+         const char *reason = "none";
+         if (!fd_stable)
+            reason = "fd-drift";
+         else if (!maps_stable)
+            reason = "map-count-drift";
+         else if (!mapped_bytes_stable)
+            reason = "mapped-bytes-drift";
+         else if (size.classification ==
+                  DriftClass::inconclusive_late_drift)
+            reason = "vmsize-late-drift";
+         else if (size_growth)
+            reason = "vmsize-growth";
+         else if (size.classification == DriftClass::bounded_drift)
+            reason = "bounded-vmsize-drift";
+         else if (size.classification == DriftClass::growth)
+            reason = "no-net-vmsize-growth";
+         const char *result =
+            resource_dut ? dut_result : class_name(observed);
+         __android_log_print(
+            resource_dut && !accepted ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO,
+            "PanvkPresent",
+            "jm-async[%s]: %s sampling=VALID result=%s gate=%s role=%s "
+            "phase=%s "
+            "heuristic=target-probe-vmsize "
+            "warmup=%u intervals=%zu work=%u work_unit=%s "
+            "ownership_class=%s ownership_first_change_checkpoint=%u "
+            "ownership_transitions=%u ownership_plateau_points=%zu "
+            "size_class=%s size_first_change_checkpoint=%u "
+            "size_transitions=%u "
+            "size_plateau_points=%zu "
+            "fd_baseline=%ld fd_max=%ld fd_final=%ld "
+            "maps_baseline=%ld maps_max=%ld maps_final=%ld "
+            "mapped_bytes_baseline=%llu mapped_bytes_max=%llu "
+            "mapped_bytes_final=%llu "
+            "size_kb_baseline=%ld size_kb_min=%ld size_kb_max=%ld "
+            "size_kb_final=%ld size_median=%ld->%ld "
+            "size_positive_transitions=%u size_positive_run=%u "
+            "rss_kb_baseline=%ld rss_kb_min=%ld rss_kb_max=%ld "
+            "rss_kb_final=%ld rss_median=%ld->%ld rss_gate=diagnostic "
+            "reason=%s scope=same-process-target-probe",
+            label, resource_record, result, resource_policy, resource_role,
+            phase, warmup, checkpoint_count, work_count, work_unit,
+            class_name(ownership.classification),
+            first_change_checkpoint(ownership), ownership.transitions,
+            ownership.plateau_points, class_name(size.classification),
+            first_change_checkpoint(size), size.transitions,
+            size.plateau_points, baseline.fds, fd_max, final.fds,
+            baseline.maps, maps_max, final.maps,
+            static_cast<unsigned long long>(baseline.mapped_bytes),
+            static_cast<unsigned long long>(mapped_bytes_max),
+            static_cast<unsigned long long>(final.mapped_bytes),
+            baseline.size_kb, size_min, size_max, final.size_kb,
+            first_size_median, last_size_median, size_positive_transitions,
+            size_max_positive_run, baseline.rss_kb, rss_min, rss_max,
+            final.rss_kb, first_rss_median, last_rss_median, reason);
+         return !resource_dut || accepted;
+      };
 
       auto async_cleanup = [&]() {
          if (state_map)
@@ -1206,6 +1503,12 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          return true;
       };
 
+      const ResourceSnapshot wave_throwaway = resource_snapshot();
+      if (!require_snapshot("waves", "throwaway", wave_throwaway)) {
+         async_cleanup();
+         return false;
+      }
+      std::array<ResourceSnapshot, wave_count> wave_resources{};
       async_result = initialize_state();
       if (async_result != VK_SUCCESS)
          return async_failed("vkFlushMappedMemoryRanges(waves)", async_result);
@@ -1245,11 +1548,27 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
             async_cleanup();
             return false;
          }
+         wave_resources[wave] = resource_snapshot();
+         char checkpoint[24];
+         std::snprintf(checkpoint, sizeof(checkpoint), "wave-%u", wave + 1);
+         if (!require_snapshot("waves", checkpoint, wave_resources[wave])) {
+            async_cleanup();
+            return false;
+         }
          if (wave + 1 != wave_count) {
             async_result = ResetFences(device, 1, &async_fence);
             if (async_result != VK_SUCCESS)
                return async_failed("vkResetFences(waves)", async_result);
          }
+      }
+      if (!resource_gate(
+             "waves", wave_warmup,
+             (wave_count - wave_warmup) * wave_size, "submits",
+             wave_resources[wave_warmup - 1],
+             wave_resources.data() + wave_warmup,
+             wave_count - wave_warmup, 4, wave_warmup + 1, 1)) {
+         async_cleanup();
+         return false;
       }
       LOGI("jm-async[%s]: PASS mode=waves submissions=%u waves=%u live_cb=%u "
            "terminal=%08x immediate_fences=%u",
@@ -1292,7 +1611,9 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
            "terminal=%08x immediate_fences=%u",
            label, chain_size, chain_terminal, immediate_fences);
 
-      constexpr uint32_t semaphore_cycles = 64;
+      ResourceSnapshot semaphore_baseline{};
+      std::array<ResourceSnapshot, semaphore_checkpoints>
+         semaphore_resources{};
       for (uint32_t cycle = 0; cycle < semaphore_cycles; ++cycle) {
          const uint32_t terminal = 0x53454d00u + cycle + 1;
          async_result = initialize_state();
@@ -1360,33 +1681,45 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
             async_cleanup();
             return false;
          }
+         const uint32_t completed_cycles = cycle + 1;
+         if (completed_cycles % semaphore_interval == 0) {
+            const ResourceSnapshot snapshot = resource_snapshot();
+            char checkpoint[32];
+            std::snprintf(checkpoint, sizeof(checkpoint), "cycle-%u",
+                          completed_cycles);
+            if (!require_snapshot("binary-semaphore", checkpoint, snapshot)) {
+               async_cleanup();
+               return false;
+            }
+            if (completed_cycles == semaphore_interval) {
+               semaphore_baseline = snapshot;
+            } else {
+               semaphore_resources[completed_cycles / semaphore_interval - 2] =
+                  snapshot;
+            }
+         }
+      }
+      if (!resource_gate("binary-semaphore", semaphore_interval,
+                         (semaphore_cycles - semaphore_interval) * 2,
+                         "submits", semaphore_baseline,
+                         semaphore_resources.data(),
+                         semaphore_resources.size(), 3,
+                         semaphore_interval * 2, semaphore_interval)) {
+         async_cleanup();
+         return false;
       }
       LOGI("jm-async[%s]: PASS mode=binary-semaphore "
-           "scope=same-queue-lifecycle cycles=%u concurrent_waiters=2",
+           "scope=same-queue-reuse cycles=%u concurrent_waiters=2",
            label, semaphore_cycles);
       async_cleanup();
-      const ResourceSnapshot resources_after = resource_snapshot();
-      const bool resource_counting =
-         resources_before.fds >= 0 && resources_after.fds >= 0 &&
-         resources_before.maps >= 0 && resources_after.maps >= 0 &&
-         resources_before.rss_kb >= 0 && resources_after.rss_kb >= 0 &&
-         resources_before.size_kb >= 0 && resources_after.size_kb >= 0;
-      auto delta = [](long before, long after) {
-         return before < 0 || after < 0 ? -1l : after - before;
-      };
-      LOGI("jm-async[%s]: RESOURCE counting=%u "
-           "fd_before=%ld fd_after=%ld fd_delta=%ld "
-           "maps_before=%ld maps_after=%ld maps_delta=%ld "
-           "rss_kb_before=%ld rss_kb_after=%ld rss_kb_delta=%ld "
-           "size_kb_before=%ld size_kb_after=%ld size_kb_delta=%ld",
-           label, resource_counting, resources_before.fds, resources_after.fds,
-           delta(resources_before.fds, resources_after.fds),
-           resources_before.maps, resources_after.maps,
-           delta(resources_before.maps, resources_after.maps),
-           resources_before.rss_kb, resources_after.rss_kb,
-           delta(resources_before.rss_kb, resources_after.rss_kb),
-           resources_before.size_kb, resources_after.size_kb,
-           delta(resources_before.size_kb, resources_after.size_kb));
+      const ResourceSnapshot post_cleanup = resource_snapshot();
+      LOGI("jm-async[%s]: RESOURCE DIAGNOSTIC phase=post-cleanup "
+           "available=%u fd=%ld maps=%ld mapped_bytes=%llu "
+           "size_kb=%ld rss_kb=%ld",
+           label, static_cast<unsigned>(snapshot_complete(post_cleanup)),
+           post_cleanup.fds, post_cleanup.maps,
+           static_cast<unsigned long long>(post_cleanup.mapped_bytes),
+           post_cleanup.size_kb, post_cleanup.rss_kb);
       return true;
    };
    if (!async_submission_probe()) {

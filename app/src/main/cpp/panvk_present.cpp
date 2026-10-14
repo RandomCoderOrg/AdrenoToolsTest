@@ -349,6 +349,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkCmdBindPipeline, CmdBindPipeline);
    DEVICE_PROC(PFN_vkCmdBindDescriptorSets, CmdBindDescriptorSets);
    DEVICE_PROC(PFN_vkCmdDispatch, CmdDispatch);
+   DEVICE_PROC(PFN_vkCmdFillBuffer, CmdFillBuffer);
    DEVICE_PROC(PFN_vkCreateRenderPass, CreateRenderPass);
    DEVICE_PROC(PFN_vkDestroyRenderPass, DestroyRenderPass);
    DEVICE_PROC(PFN_vkCreateFramebuffer, CreateFramebuffer);
@@ -479,7 +480,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !CreatePipelineLayout || !DestroyPipelineLayout ||
        !CreateComputePipelines || !CreateGraphicsPipelines ||
        !DestroyPipeline || !CmdBindPipeline ||
-       !CmdBindDescriptorSets || !CmdDispatch || !CmdPipelineBarrier ||
+       !CmdBindDescriptorSets || !CmdDispatch || !CmdFillBuffer ||
+       !CmdPipelineBarrier ||
        !CreateRenderPass || !DestroyRenderPass || !CreateFramebuffer ||
        !DestroyFramebuffer || !CmdBeginRenderPass || !CmdEndRenderPass ||
        !CmdDraw || !CmdBindIndexBuffer || !CmdDrawIndexed ||
@@ -821,6 +823,583 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
         label, compute_expected.size(),
         static_cast<unsigned long long>(compute_actual_hash), memory_type,
         memory_flags);
+
+   enum class LifecycleCycleResult {
+      pass,
+      fail_safe,
+   };
+   struct LifecycleResourceSnapshot {
+      long fds = -1;
+      long maps = -1;
+      long rss_kb = -1;
+      long size_kb = -1;
+      uint64_t mapped_bytes = UINT64_MAX;
+   };
+   auto lifecycle_resource_snapshot = []() {
+      LifecycleResourceSnapshot snapshot;
+      if (DIR *directory = opendir("/proc/self/fd")) {
+         snapshot.fds = 0;
+         while (dirent *entry = readdir(directory)) {
+            if (std::strcmp(entry->d_name, ".") &&
+                std::strcmp(entry->d_name, ".."))
+               ++snapshot.fds;
+         }
+         closedir(directory);
+      }
+      if (FILE *maps = std::fopen("/proc/self/maps", "r")) {
+         snapshot.maps = 0;
+         snapshot.mapped_bytes = 0;
+         bool valid = true;
+         char *line = nullptr;
+         size_t capacity = 0;
+         while (getline(&line, &capacity, maps) >= 0) {
+            unsigned long long start = 0;
+            unsigned long long end = 0;
+            ++snapshot.maps;
+            if (std::sscanf(line, "%llx-%llx", &start, &end) != 2 ||
+                end < start ||
+                UINT64_MAX - snapshot.mapped_bytes < end - start) {
+               valid = false;
+               continue;
+            }
+            snapshot.mapped_bytes += end - start;
+         }
+         std::free(line);
+         if (std::ferror(maps) || !valid) {
+            snapshot.maps = -1;
+            snapshot.mapped_bytes = UINT64_MAX;
+         }
+         std::fclose(maps);
+      }
+      if (FILE *status = std::fopen("/proc/self/status", "r")) {
+         char line[256];
+         while (std::fgets(line, sizeof(line), status)) {
+            std::sscanf(line, "VmRSS: %ld kB", &snapshot.rss_kb);
+            std::sscanf(line, "VmSize: %ld kB", &snapshot.size_kb);
+         }
+         std::fclose(status);
+      }
+      return snapshot;
+   };
+   auto lifecycle_snapshot_complete =
+      [](const LifecycleResourceSnapshot &snapshot) {
+         return snapshot.fds >= 0 && snapshot.maps >= 0 &&
+                snapshot.rss_kb >= 0 && snapshot.size_kb >= 0 &&
+                snapshot.mapped_bytes != UINT64_MAX;
+      };
+   auto lifecycle_ownership_equal =
+      [](const LifecycleResourceSnapshot &left,
+         const LifecycleResourceSnapshot &right) {
+         return left.fds == right.fds && left.maps == right.maps &&
+                left.mapped_bytes == right.mapped_bytes &&
+                left.size_kb == right.size_kb;
+      };
+
+   constexpr VkDeviceSize lifecycle_buffer_size = 4096;
+   constexpr uint32_t lifecycle_dispatch_groups = 15;
+   constexpr uint32_t lifecycle_shader_words =
+      lifecycle_dispatch_groups * 64;
+   constexpr uint32_t lifecycle_sentinel_zero_index = lifecycle_shader_words;
+   constexpr uint32_t lifecycle_sentinel_one_index =
+      lifecycle_shader_words + 1;
+   constexpr uint32_t lifecycle_guard_front_index =
+      lifecycle_shader_words + 2;
+   constexpr uint32_t lifecycle_guard_back_index =
+      lifecycle_buffer_size / sizeof(uint32_t) - 1;
+   constexpr uint32_t lifecycle_guard_front = 0x13579bdfu;
+   constexpr uint32_t lifecycle_guard_back = 0xfdb97531u;
+   constexpr uint64_t lifecycle_fence_timeout_ns =
+      5ull * 1000 * 1000 * 1000;
+   static_assert(lifecycle_guard_front_index < lifecycle_guard_back_index,
+                 "lifecycle sentinels must be outside shader writes");
+
+   auto lifecycle_cycle = [&](const char *phase,
+                              uint32_t cycle) -> LifecycleCycleResult {
+      VkBuffer cycle_buffer{};
+      VkDeviceMemory cycle_memory{};
+      void *cycle_map{};
+      VkDescriptorPool cycle_descriptor_pool{};
+      VkCommandPool cycle_command_pool{};
+      VkSemaphore cycle_semaphore{};
+      VkFence cycle_fence{};
+      bool submitted = false;
+      bool completed = false;
+
+      auto release_cycle = [&]() {
+         if (cycle_map)
+            UnmapMemory(device, cycle_memory);
+         if (cycle_fence)
+            DestroyFence(device, cycle_fence, nullptr);
+         if (cycle_semaphore)
+            DestroySemaphore(device, cycle_semaphore, nullptr);
+         if (cycle_command_pool)
+            DestroyCommandPool(device, cycle_command_pool, nullptr);
+         if (cycle_descriptor_pool)
+            DestroyDescriptorPool(device, cycle_descriptor_pool, nullptr);
+         if (cycle_buffer)
+            DestroyBuffer(device, cycle_buffer, nullptr);
+         if (cycle_memory)
+            FreeMemory(device, cycle_memory, nullptr);
+      };
+      auto functional_fail = [&](const char *operation,
+                                 VkResult failure) {
+         LOGE("lifecycle-churn[%s]: result=FUNCTIONAL_FAIL phase=%s "
+              "cycle=%u operation=%s vk_result=%d submitted=%u "
+              "completed=%u",
+              label, phase, cycle, operation, failure, submitted, completed);
+         release_cycle();
+         return LifecycleCycleResult::fail_safe;
+      };
+      auto completion_inconclusive = [&](const char *operation,
+                                         VkResult failure)
+         -> LifecycleCycleResult {
+         LOGE("lifecycle-churn[%s]: result=INCONCLUSIVE "
+              "failure=FUNCTIONAL phase=%s cycle=%u operation=%s "
+              "vk_result=%d submitted=1 completed=0 "
+              "reason=completion-uncertain action=terminate-process "
+              "exit_code=124 resources=retained",
+              label, phase, cycle, operation, failure);
+         _exit(124);
+      };
+
+      VkBufferCreateInfo cycle_buffer_info{
+         VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      cycle_buffer_info.size = lifecycle_buffer_size;
+      cycle_buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      cycle_buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      VkResult cycle_result =
+         CreateBuffer(device, &cycle_buffer_info, nullptr, &cycle_buffer);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkCreateBuffer", cycle_result);
+
+      VkMemoryRequirements cycle_requirements{};
+      GetBufferMemoryRequirements(device, cycle_buffer, &cycle_requirements);
+      uint32_t cycle_memory_type = UINT32_MAX;
+      for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+         if ((cycle_requirements.memoryTypeBits & (1u << i)) &&
+             (memory_properties.memoryTypes[i].propertyFlags &
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            cycle_memory_type = i;
+            break;
+         }
+      }
+      if (cycle_memory_type == UINT32_MAX)
+         return functional_fail("host-visible-memory-type",
+                                VK_ERROR_FEATURE_NOT_PRESENT);
+      const VkMemoryPropertyFlags cycle_memory_flags =
+         memory_properties.memoryTypes[cycle_memory_type].propertyFlags;
+      VkMemoryAllocateInfo cycle_alloc_info{
+         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      cycle_alloc_info.allocationSize = cycle_requirements.size;
+      cycle_alloc_info.memoryTypeIndex = cycle_memory_type;
+      cycle_result =
+         AllocateMemory(device, &cycle_alloc_info, nullptr, &cycle_memory);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkAllocateMemory", cycle_result);
+      cycle_result = BindBufferMemory(device, cycle_buffer, cycle_memory, 0);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkBindBufferMemory", cycle_result);
+      cycle_result = MapMemory(device, cycle_memory, 0, VK_WHOLE_SIZE, 0,
+                               &cycle_map);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkMapMemory", cycle_result);
+
+      const uint32_t phase_tag =
+         std::strcmp(phase, "measured") == 0 ? 0x00010000u : 0u;
+      const uint32_t padding = 0xa11c0000u ^ phase_tag ^ cycle;
+      const uint32_t expected_sentinel_zero =
+         0xc1c00000u ^ phase_tag ^ cycle;
+      const uint32_t expected_sentinel_one =
+         0x5e1e0000u ^ phase_tag ^ cycle;
+      auto *cycle_words = static_cast<uint32_t *>(cycle_map);
+      std::fill_n(cycle_words,
+                  lifecycle_buffer_size / sizeof(uint32_t), padding);
+      cycle_words[lifecycle_sentinel_zero_index] = 0xbaadf00du;
+      cycle_words[lifecycle_sentinel_one_index] = 0xdead10ccu;
+      cycle_words[lifecycle_guard_front_index] = lifecycle_guard_front;
+      cycle_words[lifecycle_guard_back_index] = lifecycle_guard_back;
+      if (!(cycle_memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = cycle_memory;
+         range.size = VK_WHOLE_SIZE;
+         cycle_result = FlushMappedMemoryRanges(device, 1, &range);
+         if (cycle_result != VK_SUCCESS)
+            return functional_fail("vkFlushMappedMemoryRanges", cycle_result);
+      }
+
+      VkDescriptorPoolSize cycle_pool_size{
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+      VkDescriptorPoolCreateInfo cycle_descriptor_pool_info{
+         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      cycle_descriptor_pool_info.maxSets = 1;
+      cycle_descriptor_pool_info.poolSizeCount = 1;
+      cycle_descriptor_pool_info.pPoolSizes = &cycle_pool_size;
+      cycle_result = CreateDescriptorPool(device, &cycle_descriptor_pool_info,
+                                          nullptr, &cycle_descriptor_pool);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkCreateDescriptorPool", cycle_result);
+      VkDescriptorSet cycle_descriptor_set{};
+      VkDescriptorSetAllocateInfo cycle_descriptor_allocate_info{
+         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      cycle_descriptor_allocate_info.descriptorPool = cycle_descriptor_pool;
+      cycle_descriptor_allocate_info.descriptorSetCount = 1;
+      cycle_descriptor_allocate_info.pSetLayouts = &descriptor_layout;
+      cycle_result = AllocateDescriptorSets(
+         device, &cycle_descriptor_allocate_info, &cycle_descriptor_set);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkAllocateDescriptorSets", cycle_result);
+      VkDescriptorBufferInfo cycle_descriptor_buffer{
+         cycle_buffer, 0, lifecycle_buffer_size};
+      VkWriteDescriptorSet cycle_descriptor_write{
+         VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      cycle_descriptor_write.dstSet = cycle_descriptor_set;
+      cycle_descriptor_write.dstBinding = 0;
+      cycle_descriptor_write.descriptorCount = 1;
+      cycle_descriptor_write.descriptorType =
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      cycle_descriptor_write.pBufferInfo = &cycle_descriptor_buffer;
+      UpdateDescriptorSets(device, 1, &cycle_descriptor_write, 0, nullptr);
+
+      VkCommandPoolCreateInfo cycle_command_pool_info{
+         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      cycle_command_pool_info.queueFamilyIndex = queue_family;
+      cycle_result = CreateCommandPool(device, &cycle_command_pool_info,
+                                       nullptr, &cycle_command_pool);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkCreateCommandPool", cycle_result);
+      VkCommandBuffer cycle_commands[2]{};
+      VkCommandBufferAllocateInfo cycle_command_allocate_info{
+         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      cycle_command_allocate_info.commandPool = cycle_command_pool;
+      cycle_command_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      cycle_command_allocate_info.commandBufferCount = 2;
+      cycle_result = AllocateCommandBuffers(device,
+                                            &cycle_command_allocate_info,
+                                            cycle_commands);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkAllocateCommandBuffers", cycle_result);
+      for (uint32_t i = 0; i < 2; ++i) {
+         VkCommandBufferBeginInfo cycle_begin_info{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+         cycle_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         cycle_result = BeginCommandBuffer(cycle_commands[i],
+                                           &cycle_begin_info);
+         if (cycle_result != VK_SUCCESS)
+            return functional_fail("vkBeginCommandBuffer", cycle_result);
+         CmdBindPipeline(cycle_commands[i], VK_PIPELINE_BIND_POINT_COMPUTE,
+                         compute_pipeline);
+         CmdBindDescriptorSets(cycle_commands[i],
+                               VK_PIPELINE_BIND_POINT_COMPUTE,
+                               compute_pipeline_layout, 0, 1,
+                               &cycle_descriptor_set, 0, nullptr);
+         CmdDispatch(cycle_commands[i], lifecycle_dispatch_groups, 1, 1);
+         const VkDeviceSize sentinel_offset =
+            static_cast<VkDeviceSize>(i == 0
+                                         ? lifecycle_sentinel_zero_index
+                                         : lifecycle_sentinel_one_index) *
+            sizeof(uint32_t);
+         CmdFillBuffer(cycle_commands[i], cycle_buffer, sentinel_offset,
+                       sizeof(uint32_t),
+                       i == 0 ? expected_sentinel_zero
+                              : expected_sentinel_one);
+         if (i == 1) {
+            VkBufferMemoryBarrier host_barrier{
+               VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            host_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                         VK_ACCESS_TRANSFER_WRITE_BIT;
+            host_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            host_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_barrier.buffer = cycle_buffer;
+            host_barrier.size = lifecycle_buffer_size;
+            CmdPipelineBarrier(cycle_commands[i],
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                               &host_barrier, 0, nullptr);
+         }
+         cycle_result = EndCommandBuffer(cycle_commands[i]);
+         if (cycle_result != VK_SUCCESS)
+            return functional_fail("vkEndCommandBuffer", cycle_result);
+      }
+
+      VkSemaphoreCreateInfo semaphore_info{
+         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+      cycle_result = CreateSemaphore(device, &semaphore_info, nullptr,
+                                     &cycle_semaphore);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkCreateSemaphore", cycle_result);
+      VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      cycle_result = CreateFence(device, &fence_info, nullptr, &cycle_fence);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkCreateFence", cycle_result);
+      cycle_result = WaitForFences(device, 1, &cycle_fence, VK_TRUE, 0);
+      if (cycle_result != VK_TIMEOUT)
+         return functional_fail("fresh-fence-timeout-zero", cycle_result);
+
+      VkSubmitInfo first_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      first_submit.commandBufferCount = 1;
+      first_submit.pCommandBuffers = &cycle_commands[0];
+      first_submit.signalSemaphoreCount = 1;
+      first_submit.pSignalSemaphores = &cycle_semaphore;
+      cycle_result = QueueSubmit(queue, 1, &first_submit, VK_NULL_HANDLE);
+      if (cycle_result != VK_SUCCESS)
+         return functional_fail("vkQueueSubmit(first)", cycle_result);
+      submitted = true;
+
+      VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT;
+      VkSubmitInfo second_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      second_submit.waitSemaphoreCount = 1;
+      second_submit.pWaitSemaphores = &cycle_semaphore;
+      second_submit.pWaitDstStageMask = &wait_stage;
+      second_submit.commandBufferCount = 1;
+      second_submit.pCommandBuffers = &cycle_commands[1];
+      cycle_result = QueueSubmit(queue, 1, &second_submit, cycle_fence);
+      if (cycle_result != VK_SUCCESS)
+         return completion_inconclusive("vkQueueSubmit(second)",
+                                        cycle_result);
+      cycle_result = WaitForFences(device, 1, &cycle_fence, VK_TRUE,
+                                   lifecycle_fence_timeout_ns);
+      if (cycle_result != VK_SUCCESS)
+         return completion_inconclusive("vkWaitForFences", cycle_result);
+      completed = true;
+
+      if (!(cycle_memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = cycle_memory;
+         range.size = VK_WHOLE_SIZE;
+         cycle_result = InvalidateMappedMemoryRanges(device, 1, &range);
+         if (cycle_result != VK_SUCCESS)
+            return functional_fail("vkInvalidateMappedMemoryRanges",
+                                   cycle_result);
+      }
+
+      for (uint32_t i = 0; i < lifecycle_shader_words; ++i) {
+         const uint32_t expected_value =
+            (0x045d9f3bu * (i + 3u)) ^ 0xc001d00du;
+         if (cycle_words[i] != expected_value) {
+            LOGE("lifecycle-churn[%s]: result=FUNCTIONAL_FAIL phase=%s "
+                 "cycle=%u reason=data-mismatch word=%u expected=%08x "
+                 "actual=%08x submitted=1 completed=1",
+                 label, phase, cycle, i, expected_value, cycle_words[i]);
+            release_cycle();
+            return LifecycleCycleResult::fail_safe;
+         }
+      }
+      if (cycle_words[lifecycle_sentinel_zero_index] !=
+             expected_sentinel_zero ||
+          cycle_words[lifecycle_sentinel_one_index] !=
+             expected_sentinel_one ||
+          cycle_words[lifecycle_guard_front_index] != lifecycle_guard_front ||
+          cycle_words[lifecycle_guard_back_index] != lifecycle_guard_back) {
+         LOGE("lifecycle-churn[%s]: result=FUNCTIONAL_FAIL phase=%s "
+              "cycle=%u reason=sentinel-or-guard-mismatch "
+              "sentinel0=%08x/%08x sentinel1=%08x/%08x "
+              "front=%08x/%08x back=%08x/%08x submitted=1 completed=1",
+              label, phase, cycle,
+              cycle_words[lifecycle_sentinel_zero_index],
+              expected_sentinel_zero,
+              cycle_words[lifecycle_sentinel_one_index],
+              expected_sentinel_one,
+              cycle_words[lifecycle_guard_front_index],
+              lifecycle_guard_front,
+              cycle_words[lifecycle_guard_back_index], lifecycle_guard_back);
+         release_cycle();
+         return LifecycleCycleResult::fail_safe;
+      }
+      for (uint32_t i = lifecycle_guard_front_index + 1;
+           i < lifecycle_guard_back_index; ++i) {
+         if (cycle_words[i] != padding) {
+            LOGE("lifecycle-churn[%s]: result=FUNCTIONAL_FAIL phase=%s "
+                 "cycle=%u reason=padding-mismatch word=%u expected=%08x "
+                 "actual=%08x submitted=1 completed=1",
+                 label, phase, cycle, i, padding, cycle_words[i]);
+            release_cycle();
+            return LifecycleCycleResult::fail_safe;
+         }
+      }
+
+      release_cycle();
+      return LifecycleCycleResult::pass;
+   };
+
+   const bool lifecycle_dut = std::strcmp(label, "panvk") == 0;
+   const char *lifecycle_record =
+      lifecycle_dut ? "RESOURCE_GATE" : "RESOURCE_CONTROL";
+   const char *lifecycle_role = lifecycle_dut ? "DUT" : "CONTROL";
+   const char *lifecycle_gate = lifecycle_dut ? "EXACT" : "DIAGNOSTIC";
+   auto lifecycle_log_snapshot = [&](const char *result_name,
+                                     const char *phase, uint32_t cycle,
+                                     const LifecycleResourceSnapshot &baseline,
+                                     const LifecycleResourceSnapshot &current) {
+      __android_log_print(
+         lifecycle_dut && std::strcmp(result_name, "PASS_STABLE")
+            ? ANDROID_LOG_ERROR
+            : ANDROID_LOG_INFO,
+         "PanvkPresent",
+         "lifecycle-churn[%s]: %s result=%s role=%s gate=%s phase=%s "
+         "cycle=%u fd=%ld->%ld maps=%ld->%ld mapped_bytes=%llu->%llu "
+         "size_kb=%ld->%ld rss_kb=%ld->%ld rss_gate=diagnostic",
+         label, lifecycle_record, result_name, lifecycle_role, lifecycle_gate,
+         phase, cycle, baseline.fds, current.fds, baseline.maps, current.maps,
+         static_cast<unsigned long long>(baseline.mapped_bytes),
+         static_cast<unsigned long long>(current.mapped_bytes),
+         baseline.size_kb, current.size_kb, baseline.rss_kb, current.rss_kb);
+   };
+
+   const LifecycleResourceSnapshot lifecycle_proc_warm_one =
+      lifecycle_resource_snapshot();
+   const LifecycleResourceSnapshot lifecycle_proc_warm_two =
+      lifecycle_resource_snapshot();
+   if (!lifecycle_snapshot_complete(lifecycle_proc_warm_one) ||
+       !lifecycle_snapshot_complete(lifecycle_proc_warm_two)) {
+      lifecycle_log_snapshot("INCONCLUSIVE", "proc-warm", 0,
+                             lifecycle_proc_warm_one,
+                             lifecycle_proc_warm_two);
+      if (lifecycle_dut) {
+         cleanup();
+         return false;
+      }
+   } else {
+      constexpr uint32_t lifecycle_max_warmup_cycles = 64;
+      constexpr uint32_t lifecycle_min_warmup_cycles = 16;
+      constexpr uint32_t lifecycle_stable_points = 8;
+      constexpr uint32_t lifecycle_measured_cycles = 128;
+      std::vector<LifecycleResourceSnapshot> lifecycle_warm_snapshots;
+      lifecycle_warm_snapshots.reserve(lifecycle_max_warmup_cycles);
+      LifecycleResourceSnapshot lifecycle_baseline{};
+      bool lifecycle_stabilized = false;
+      uint32_t lifecycle_warmup_cycles = 0;
+      for (uint32_t cycle = 1; cycle <= lifecycle_max_warmup_cycles;
+           ++cycle) {
+         const LifecycleCycleResult cycle_result =
+            lifecycle_cycle("warmup", cycle);
+         if (cycle_result == LifecycleCycleResult::fail_safe) {
+            cleanup();
+            return false;
+         }
+         const LifecycleResourceSnapshot snapshot =
+            lifecycle_resource_snapshot();
+         if (!lifecycle_snapshot_complete(snapshot)) {
+            lifecycle_log_snapshot("INCONCLUSIVE", "warmup", cycle,
+                                   lifecycle_proc_warm_two, snapshot);
+            if (lifecycle_dut) {
+               cleanup();
+               return false;
+            }
+            break;
+         }
+         lifecycle_warm_snapshots.push_back(snapshot);
+         if (cycle >= lifecycle_min_warmup_cycles &&
+             lifecycle_warm_snapshots.size() >= lifecycle_stable_points) {
+            const size_t first = lifecycle_warm_snapshots.size() -
+                                 lifecycle_stable_points;
+            lifecycle_stabilized = true;
+            for (size_t i = first + 1;
+                 i < lifecycle_warm_snapshots.size(); ++i) {
+               lifecycle_stabilized &= lifecycle_ownership_equal(
+                  lifecycle_warm_snapshots[first],
+                  lifecycle_warm_snapshots[i]);
+            }
+            if (lifecycle_stabilized) {
+               lifecycle_baseline = lifecycle_warm_snapshots.back();
+               lifecycle_warmup_cycles = cycle;
+               break;
+            }
+         }
+      }
+
+      if (!lifecycle_stabilized) {
+         const LifecycleResourceSnapshot current =
+            lifecycle_warm_snapshots.empty()
+               ? lifecycle_proc_warm_two
+               : lifecycle_warm_snapshots.back();
+         lifecycle_log_snapshot("INCONCLUSIVE", "warmup",
+                                lifecycle_warm_snapshots.size(),
+                                lifecycle_proc_warm_two, current);
+         if (lifecycle_dut) {
+            cleanup();
+            return false;
+         }
+      } else {
+         bool lifecycle_resource_drift = false;
+         bool lifecycle_sampling_inconclusive = false;
+         uint32_t lifecycle_first_drift_cycle = 0;
+         uint32_t lifecycle_first_invalid_cycle = 0;
+         LifecycleResourceSnapshot lifecycle_first_drift{};
+         LifecycleResourceSnapshot lifecycle_first_invalid{};
+         LifecycleResourceSnapshot lifecycle_final = lifecycle_baseline;
+         long lifecycle_rss_min = lifecycle_baseline.rss_kb;
+         long lifecycle_rss_max = lifecycle_baseline.rss_kb;
+         for (uint32_t cycle = 1; cycle <= lifecycle_measured_cycles;
+              ++cycle) {
+            const LifecycleCycleResult cycle_result =
+               lifecycle_cycle("measured", cycle);
+            if (cycle_result == LifecycleCycleResult::fail_safe) {
+               cleanup();
+               return false;
+            }
+            lifecycle_final = lifecycle_resource_snapshot();
+            if (!lifecycle_snapshot_complete(lifecycle_final)) {
+               lifecycle_log_snapshot("INCONCLUSIVE", "measured", cycle,
+                                      lifecycle_baseline, lifecycle_final);
+               if (lifecycle_dut) {
+                  cleanup();
+                  return false;
+               }
+               if (!lifecycle_sampling_inconclusive) {
+                  lifecycle_sampling_inconclusive = true;
+                  lifecycle_first_invalid_cycle = cycle;
+                  lifecycle_first_invalid = lifecycle_final;
+               }
+               continue;
+            }
+            lifecycle_rss_min =
+               std::min(lifecycle_rss_min, lifecycle_final.rss_kb);
+            lifecycle_rss_max =
+               std::max(lifecycle_rss_max, lifecycle_final.rss_kb);
+            if (!lifecycle_ownership_equal(lifecycle_baseline,
+                                           lifecycle_final) &&
+                !lifecycle_resource_drift) {
+               lifecycle_resource_drift = true;
+               lifecycle_first_drift_cycle = cycle;
+               lifecycle_first_drift = lifecycle_final;
+            }
+         }
+
+         const char *lifecycle_result = "PASS_STABLE";
+         if (lifecycle_sampling_inconclusive)
+            lifecycle_result = "INCONCLUSIVE";
+         else if (lifecycle_resource_drift)
+            lifecycle_result = lifecycle_dut ? "FAIL_RESOURCE_DRIFT"
+                                             : "CONTROL_DRIFT";
+         lifecycle_log_snapshot(lifecycle_result, "measured",
+                                lifecycle_sampling_inconclusive
+                                   ? lifecycle_first_invalid_cycle
+                                   : lifecycle_resource_drift
+                                   ? lifecycle_first_drift_cycle
+                                   : lifecycle_measured_cycles,
+                                lifecycle_baseline,
+                                lifecycle_sampling_inconclusive
+                                   ? lifecycle_first_invalid
+                                   : lifecycle_resource_drift
+                                   ? lifecycle_first_drift
+                                   : lifecycle_final);
+         LOGI("lifecycle-churn[%s]: SUMMARY result=%s role=%s gate=%s "
+              "warmup_cycles=%u stable_points=%u measured_cycles=%u "
+              "rss_kb_min=%ld rss_kb_max=%ld rss_gate=diagnostic",
+              label, lifecycle_result, lifecycle_role, lifecycle_gate,
+              lifecycle_warmup_cycles, lifecycle_stable_points,
+              lifecycle_measured_cycles, lifecycle_rss_min,
+              lifecycle_rss_max);
+         if (lifecycle_dut && lifecycle_resource_drift) {
+            cleanup();
+            return false;
+         }
+      }
+   }
 
    auto async_submission_probe = [&]() {
       constexpr uint32_t stamp_count = 4096;

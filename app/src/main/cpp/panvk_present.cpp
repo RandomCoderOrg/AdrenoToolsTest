@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <jni.h>
 #include <strings.h>
 #include <unistd.h>
 
@@ -12,10 +13,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -32,6 +36,15 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PanvkPresent", __VA_ARGS__)
 
 namespace {
+struct ScenePushConstants {
+   float monotonic_seconds;
+   float width;
+   float height;
+   float aspect;
+};
+static_assert(sizeof(ScenePushConstants) == 4 * sizeof(float),
+              "scene push constant must be exactly vec4");
+
 struct State {
    void *loader{};
    VkInstance instance{};
@@ -51,6 +64,14 @@ struct State {
    uint32_t queue_family{};
    uint32_t frame{};
    VkExtent2D extent{};
+   std::string device_name;
+   std::chrono::steady_clock::time_point scene_start{};
+   std::chrono::steady_clock::time_point stats_window_start{};
+   std::chrono::steady_clock::time_point last_successful_present{};
+   uint32_t stats_present_calls{};
+   uint32_t stats_interval_count{};
+   double stats_interval_sum_ms{};
+   bool has_successful_present{};
    std::vector<VkImage> images;
    std::vector<VkImageView> image_views;
    std::vector<VkFramebuffer> framebuffers;
@@ -80,6 +101,7 @@ struct State {
    PFN_vkCmdBindPipeline CmdBindPipeline{};
    PFN_vkCmdSetViewport CmdSetViewport{};
    PFN_vkCmdSetScissor CmdSetScissor{};
+   PFN_vkCmdPushConstants CmdPushConstants{};
    PFN_vkCmdDraw CmdDraw{};
    PFN_vkEndCommandBuffer EndCommandBuffer{};
    PFN_vkQueueSubmit QueueSubmit{};
@@ -88,6 +110,32 @@ struct State {
 };
 
 State s;
+std::mutex hud_mutex;
+std::string hud_text =
+   "Present calls 0.0/s\n"
+   "CPU present interval 0.00 ms avg\n"
+   "Surface 0x0\n"
+   "GPU Not active";
+
+void publish_hud(float present_calls_per_second, double interval_ms,
+                 uint32_t width, uint32_t height, const char *device_name)
+{
+   char text[512];
+   std::snprintf(text, sizeof(text),
+                 "Present calls %.1f/s\n"
+                 "CPU present interval %.2f ms avg\n"
+                 "Surface %ux%u\n"
+                 "GPU %s",
+                 present_calls_per_second, interval_ms, width, height,
+                 device_name && device_name[0] ? device_name : "Unavailable");
+   std::lock_guard<std::mutex> lock(hud_mutex);
+   hud_text = text;
+}
+
+void reset_hud(const char *device_name)
+{
+   publish_hud(0.0f, 0.0, 0, 0, device_name);
+}
 
 template <typename T>
 T loader_proc(const char *name)
@@ -2710,8 +2758,11 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
 
 bool panvk_present_init(void *libvulkan, ANativeWindow *window)
 {
-   if (!libvulkan || !window)
+   reset_hud("Initializing");
+   if (!libvulkan || !window) {
+      reset_hud("Unavailable");
       return false;
+   }
 
    s.loader = libvulkan;
    s.GetInstanceProcAddr = loader_proc<PFN_vkGetInstanceProcAddr>(
@@ -2740,6 +2791,9 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
    s.DestroyInstance = instance_proc<PFN_vkDestroyInstance>("vkDestroyInstance");
    auto EnumeratePhysicalDevices = instance_proc<PFN_vkEnumeratePhysicalDevices>(
       "vkEnumeratePhysicalDevices");
+   auto GetPhysicalDeviceProperties =
+      instance_proc<PFN_vkGetPhysicalDeviceProperties>(
+         "vkGetPhysicalDeviceProperties");
    auto GetQueueFamilies = instance_proc<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
       "vkGetPhysicalDeviceQueueFamilyProperties");
    auto GetSurfaceSupport = loader_proc<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(
@@ -2752,9 +2806,10 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
       "vkCreateAndroidSurfaceKHR");
    auto CreateDevice = instance_proc<PFN_vkCreateDevice>("vkCreateDevice");
    s.DestroySurfaceKHR = loader_proc<PFN_vkDestroySurfaceKHR>("vkDestroySurfaceKHR");
-   if (!EnumeratePhysicalDevices || !GetQueueFamilies || !GetSurfaceSupport ||
-       !GetSurfaceCapabilities || !GetSurfaceFormats || !CreateAndroidSurface ||
-       !CreateDevice || !s.DestroySurfaceKHR) {
+   if (!EnumeratePhysicalDevices || !GetPhysicalDeviceProperties ||
+       !GetQueueFamilies || !GetSurfaceSupport || !GetSurfaceCapabilities ||
+       !GetSurfaceFormats || !CreateAndroidSurface || !CreateDevice ||
+       !s.DestroySurfaceKHR) {
       LOGE("required instance entrypoint unavailable");
       panvk_present_shutdown();
       return false;
@@ -2775,6 +2830,9 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
       panvk_present_shutdown();
       return false;
    }
+   VkPhysicalDeviceProperties physical_properties{};
+   GetPhysicalDeviceProperties(s.physical, &physical_properties);
+   s.device_name = physical_properties.deviceName;
 
    uint32_t family_count = 0;
    GetQueueFamilies(s.physical, &family_count, nullptr);
@@ -2853,6 +2911,8 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
    s.CmdBindPipeline = device_proc<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
    s.CmdSetViewport = device_proc<PFN_vkCmdSetViewport>("vkCmdSetViewport");
    s.CmdSetScissor = device_proc<PFN_vkCmdSetScissor>("vkCmdSetScissor");
+   s.CmdPushConstants =
+      device_proc<PFN_vkCmdPushConstants>("vkCmdPushConstants");
    s.CmdDraw = device_proc<PFN_vkCmdDraw>("vkCmdDraw");
    s.EndCommandBuffer = device_proc<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
    s.QueueSubmit = device_proc<PFN_vkQueueSubmit>("vkQueueSubmit");
@@ -2866,7 +2926,7 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
        !CreateGraphicsPipelines || !s.DestroyDevice ||
        !s.AcquireNextImageKHR || !s.QueuePresentKHR || !s.CmdBeginRenderPass ||
        !s.CmdEndRenderPass || !s.CmdBindPipeline || !s.CmdSetViewport ||
-       !s.CmdSetScissor || !s.CmdDraw) {
+       !s.CmdSetScissor || !s.CmdPushConstants || !s.CmdDraw) {
       LOGE("required device entrypoint unavailable");
       panvk_present_shutdown();
       return false;
@@ -3003,7 +3063,12 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
       panvk_present_shutdown();
       return false;
    }
+   VkPushConstantRange scene_push_range{};
+   scene_push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+   scene_push_range.size = sizeof(ScenePushConstants);
    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   layout_info.pushConstantRangeCount = 1;
+   layout_info.pPushConstantRanges = &scene_push_range;
    if (!check(CreatePipelineLayout(s.device, &layout_info, nullptr,
                                    &s.pipeline_layout),
               "vkCreatePipelineLayout")) {
@@ -3107,6 +3172,16 @@ bool panvk_present_init(void *libvulkan, ANativeWindow *window)
       return false;
    }
 
+   const auto now = std::chrono::steady_clock::now();
+   s.scene_start = now;
+   s.stats_window_start = now;
+   s.last_successful_present = {};
+   s.stats_present_calls = 0;
+   s.stats_interval_count = 0;
+   s.stats_interval_sum_ms = 0.0;
+   s.has_successful_present = false;
+   publish_hud(0.0f, 0.0, s.extent.width, s.extent.height,
+               s.device_name.c_str());
    LOGI("ready extent=%ux%u format=%u images=%u", s.extent.width, s.extent.height,
         format.format, swapchain_image_count);
    return true;
@@ -3132,9 +3207,8 @@ void panvk_present_draw()
    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
    if (s.BeginCommandBuffer(s.command, &begin) != VK_SUCCESS)
       return;
-   const float phase = static_cast<float>((s.frame++ % 180) / 179.0);
    VkClearValue clear{};
-   clear.color = {{0.04f + 0.18f * phase, 0.04f, 0.08f, 1.0f}};
+   clear.color = {{0.02f, 0.035f, 0.065f, 1.0f}};
    VkRenderPassBeginInfo render_pass_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
    render_pass_begin.renderPass = s.render_pass;
    render_pass_begin.framebuffer = s.framebuffers[image_index];
@@ -3148,6 +3222,19 @@ void panvk_present_draw()
    s.CmdBindPipeline(s.command, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline);
    s.CmdSetViewport(s.command, 0, 1, &viewport);
    s.CmdSetScissor(s.command, 0, 1, &scissor);
+   const auto scene_now = std::chrono::steady_clock::now();
+   const ScenePushConstants scene_push{
+      std::chrono::duration<float>(scene_now - s.scene_start).count(),
+      static_cast<float>(s.extent.width),
+      static_cast<float>(s.extent.height),
+      s.extent.height
+         ? static_cast<float>(s.extent.width) /
+              static_cast<float>(s.extent.height)
+         : 1.0f,
+   };
+   s.CmdPushConstants(s.command, s.pipeline_layout,
+                      VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(scene_push),
+                      &scene_push);
    s.CmdDraw(s.command, 3, 1, 0, 0);
    s.CmdEndRenderPass(s.command);
    if (s.EndCommandBuffer(s.command) != VK_SUCCESS)
@@ -3171,9 +3258,40 @@ void panvk_present_draw()
    present.pSwapchains = &s.swapchain;
    present.pImageIndices = &image_index;
    result = s.QueuePresentKHR(s.queue, &present);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
       LOGE("vkQueuePresentKHR failed: %d", result);
-   else if (s.frame == 1)
+      return;
+   }
+
+   const auto present_now = std::chrono::steady_clock::now();
+   ++s.stats_present_calls;
+   if (s.has_successful_present) {
+      s.stats_interval_sum_ms +=
+         std::chrono::duration<double, std::milli>(
+            present_now - s.last_successful_present)
+            .count();
+      ++s.stats_interval_count;
+   }
+   s.last_successful_present = present_now;
+   s.has_successful_present = true;
+
+   const double window_seconds =
+      std::chrono::duration<double>(present_now - s.stats_window_start).count();
+   if (window_seconds >= 0.5) {
+      const float present_calls_per_second =
+         static_cast<float>(s.stats_present_calls / window_seconds);
+      const double average_interval_ms = s.stats_interval_count
+                                            ? s.stats_interval_sum_ms /
+                                                 s.stats_interval_count
+                                            : 0.0;
+      publish_hud(present_calls_per_second, average_interval_ms,
+                  s.extent.width, s.extent.height, s.device_name.c_str());
+      s.stats_window_start = present_now;
+      s.stats_present_calls = 0;
+      s.stats_interval_count = 0;
+      s.stats_interval_sum_ms = 0.0;
+   }
+   if (s.frame++ == 0)
       LOGI("first frame presented");
 }
 
@@ -3216,4 +3334,17 @@ void panvk_present_shutdown()
    if (s.instance && s.DestroyInstance)
       s.DestroyInstance(s.instance, nullptr);
    s = {};
+   reset_hud("Not active");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_adrenotoolstest2_MainActivity_nativeStats(JNIEnv *environment,
+                                                            jobject)
+{
+   std::string copy;
+   {
+      std::lock_guard<std::mutex> lock(hud_mutex);
+      copy = hud_text;
+   }
+   return environment->NewStringUTF(copy.c_str());
 }

@@ -106,7 +106,7 @@ wait_new_pid() {
         need_online
         need_logcat
         read_pid
-        [[ -z "$PID_VALUE" ]] || return
+        [[ -z "$PID_VALUE" ]] || return 0
         sleep 0.1
     done
     die_i 'launch produced no PID within 20s'
@@ -121,7 +121,9 @@ force_stop_generation() {
     read_ticks "$pid"
     [[ "$START_TICKS" == "$ticks" ]] || die_i "PID $pid generation changed before force-stop"
     kprcs_state="$(adb shell "if [ -e '$KPRCS/$pid' ]; then echo PRESENT; else echo ABSENT; fi" 2>/dev/null | tr -d '\r')"
-    [[ "$kprcs_state" == "$expected_kprcs" ]] || die_i "kprcs/$pid was $kprcs_state before force-stop; expected $expected_kprcs"
+    if [[ "$expected_kprcs" != RECORD_ONLY ]]; then
+        [[ "$kprcs_state" == "$expected_kprcs" ]] || die_i "kprcs/$pid was $kprcs_state before force-stop; expected $expected_kprcs"
+    fi
     printf 'timestamp=%s phase=before-force-stop package=PRESENT proc=PRESENT_SAME_GENERATION kprcs=%s expected_kprcs=%s\n' \
         "$(stamp)" "$kprcs_state" "$expected_kprcs" >"$prefix-cleanup.txt"
     adb shell am force-stop "$PKG" >"$prefix-force-stop.txt" 2>&1 || { need_online; die_f 'force-stop failed'; }
@@ -168,9 +170,177 @@ force_stop_generation() {
     die_f "PID $pid, /proc, or kprcs survived force-stop"
 }
 
+parse_lifetime_line() {
+    local line="$1" payload token key value seen=' ' count=0
+    L_ERROR=
+    L_EVENT='' L_ROLE='' L_PID='' L_INSTANCE='' L_PHYSICAL='' L_LOGICAL=''
+    L_KMOD='' L_FD='' L_PATH='' L_FD_STATE='' L_ERRNO='' L_COUNT=0
+    [[ "$line" == *'panvk: jm-lifetime '* ]] || { L_ERROR='missing marker'; return 1; }
+    payload="${line#*panvk: jm-lifetime }"
+    [[ -n "$payload" && "$payload" != *'panvk: jm-lifetime '* ]] || { L_ERROR='duplicate or empty marker'; return 1; }
+    read -r -a lifetime_tokens <<<"$payload"
+    [[ ${#lifetime_tokens[@]} -gt 0 ]] || { L_ERROR='empty payload'; return 1; }
+    for token in "${lifetime_tokens[@]}"; do
+        [[ "$token" == *=* ]] || { L_ERROR="token lacks equals: $token"; return 1; }
+        key="${token%%=*}"
+        value="${token#*=}"
+        [[ -n "$key" && -n "$value" && "$value" != *=* ]] || { L_ERROR="malformed token: $token"; return 1; }
+        [[ "$seen" != *" $key "* ]] || { L_ERROR="duplicate key: $key"; return 1; }
+        seen+="$key "
+        count=$((count + 1))
+        case "$key" in
+            event) L_EVENT="$value" ;;
+            role) L_ROLE="$value" ;;
+            pid) L_PID="$value" ;;
+            instance) L_INSTANCE="$value" ;;
+            physical) L_PHYSICAL="$value" ;;
+            logical) L_LOGICAL="$value" ;;
+            kmod) L_KMOD="$value" ;;
+            fd) L_FD="$value" ;;
+            path) L_PATH="$value" ;;
+            fd_state) L_FD_STATE="$value" ;;
+            errno) L_ERRNO="$value" ;;
+            *) L_ERROR="unknown key: $key"; return 1 ;;
+        esac
+    done
+    L_COUNT="$count"
+    [[ "$L_PID" =~ ^[0-9]+$ ]] || { L_ERROR='invalid pid'; return 1; }
+    [[ "$L_INSTANCE" =~ ^0x[0-9a-fA-F]+$ ]] || { L_ERROR='invalid instance'; return 1; }
+    [[ "$L_PHYSICAL" =~ ^0x[0-9a-fA-F]+$ ]] || { L_ERROR='invalid physical object'; return 1; }
+    [[ "$L_KMOD" =~ ^0x[0-9a-fA-F]+$ ]] || { L_ERROR='invalid kmod'; return 1; }
+    [[ "$L_FD" =~ ^[0-9]+$ ]] || { L_ERROR='invalid fd'; return 1; }
+    return 0
+}
+
+require_lifetime_structure() {
+    local count="$1" logical="$2" end="$3"
+    [[ "$L_COUNT" == "$count" ]] || return 1
+    if [[ "$logical" == yes ]]; then
+        [[ "$L_LOGICAL" =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+    else
+        [[ -z "$L_LOGICAL" ]] || return 1
+    fi
+    if [[ "$end" == yes ]]; then
+        [[ -n "$L_FD_STATE" && "$L_ERRNO" =~ ^[0-9]+$ ]] || return 1
+    else
+        [[ -z "$L_FD_STATE" && -z "$L_ERRNO" ]] || return 1
+    fi
+}
+
+verify_lifetime_records() {
+    local mode="$1" log="$2" prefix="$3" pid="$4" expected i=0 line app_line last_lifetime_line
+    local physical_instance='' physical_object='' physical_kmod='' physical_fd=''
+    local logical_object='' logical_kmod='' logical_fd=''
+    if [[ "$mode" == ppoll-timeout ]]; then expected=6; else expected=2; fi
+    awk 'index($0, "panvk: jm-lifetime ") { print }' "$log" >"$prefix-lifetime.txt"
+    [[ "$(wc -l <"$prefix-lifetime.txt" | awk '{print $1}')" == "$expected" ]] ||
+        die_i "$prefix has an unexpected lifetime record count"
+    while IFS= read -r line; do
+        i=$((i + 1))
+        if ! parse_lifetime_line "$line"; then
+            die_i "$prefix lifetime record $i malformed: $L_ERROR"
+        fi
+        [[ "$L_PID" == "$pid" ]] || die_f "$prefix lifetime record $i belongs to PID $L_PID"
+        case "$i" in
+            1)
+                [[ "$L_EVENT" == CREATE && "$L_ROLE" == physical ]] ||
+                    die_f "$prefix lifetime record 1 is not physical CREATE"
+                require_lifetime_structure 8 no no || die_i "$prefix lifetime physical CREATE malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime physical CREATE path mismatch"
+                physical_instance="$L_INSTANCE"
+                physical_object="$L_PHYSICAL"
+                physical_kmod="$L_KMOD"
+                physical_fd="$L_FD"
+                ;;
+            2)
+                [[ "$L_EVENT" == CREATE && "$L_ROLE" == logical ]] ||
+                    die_f "$prefix lifetime record 2 is not logical CREATE"
+                require_lifetime_structure 9 yes no || die_i "$prefix lifetime logical CREATE malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime logical CREATE path mismatch"
+                [[ "$L_INSTANCE" == "$physical_instance" && "$L_PHYSICAL" == "$physical_object" ]] ||
+                    die_f "$prefix lifetime CREATE identities do not pair"
+                logical_object="$L_LOGICAL"
+                logical_kmod="$L_KMOD"
+                logical_fd="$L_FD"
+                [[ "$logical_kmod" != "$physical_kmod" && "$logical_fd" != "$physical_fd" ]] ||
+                    die_f "$prefix lifetime physical and logical owners are not distinct"
+                ;;
+            3)
+                [[ "$mode" == ppoll-timeout ]] || die_f "$prefix unexpected lifetime record 3"
+                [[ "$L_EVENT" == DESTROY_BEGIN && "$L_ROLE" == logical ]] ||
+                    die_f "$prefix lifetime record 3 is not logical DESTROY_BEGIN"
+                require_lifetime_structure 9 yes no || die_i "$prefix lifetime logical DESTROY_BEGIN malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime logical DESTROY_BEGIN path mismatch"
+                [[ "$L_INSTANCE" == "$physical_instance" && "$L_PHYSICAL" == "$physical_object" &&
+                   "$L_LOGICAL" == "$logical_object" && "$L_KMOD" == "$logical_kmod" && "$L_FD" == "$logical_fd" ]] ||
+                    die_f "$prefix lifetime logical DESTROY_BEGIN identity mismatch"
+                ;;
+            4)
+                [[ "$L_EVENT" == DESTROY_END && "$L_ROLE" == logical ]] ||
+                    die_f "$prefix lifetime record 4 is not logical DESTROY_END"
+                require_lifetime_structure 11 yes yes || die_i "$prefix lifetime logical DESTROY_END malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime logical DESTROY_END path mismatch"
+                [[ "$L_INSTANCE" == "$physical_instance" && "$L_PHYSICAL" == "$physical_object" &&
+                   "$L_LOGICAL" == "$logical_object" && "$L_KMOD" == "$logical_kmod" && "$L_FD" == "$logical_fd" ]] ||
+                    die_f "$prefix lifetime logical DESTROY_END identity mismatch"
+                [[ "$L_FD_STATE" == CLOSED_EBADF && "$L_ERRNO" == 9 ]] ||
+                    die_f "$prefix lifetime logical DESTROY_END did not prove a closed fd"
+                ;;
+            5)
+                [[ "$L_EVENT" == DESTROY_BEGIN && "$L_ROLE" == physical ]] ||
+                    die_f "$prefix lifetime record 5 is not physical DESTROY_BEGIN"
+                require_lifetime_structure 8 no no || die_i "$prefix lifetime physical DESTROY_BEGIN malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime physical DESTROY_BEGIN path mismatch"
+                [[ "$L_INSTANCE" == "$physical_instance" && "$L_PHYSICAL" == "$physical_object" &&
+                   "$L_KMOD" == "$physical_kmod" && "$L_FD" == "$physical_fd" ]] ||
+                    die_f "$prefix lifetime physical DESTROY_BEGIN identity mismatch"
+                ;;
+            6)
+                [[ "$L_EVENT" == DESTROY_END && "$L_ROLE" == physical ]] ||
+                    die_f "$prefix lifetime record 6 is not physical DESTROY_END"
+                require_lifetime_structure 10 no yes || die_i "$prefix lifetime physical DESTROY_END malformed"
+                [[ "$L_PATH" == /dev/mali0 ]] || die_f "$prefix lifetime physical DESTROY_END path mismatch"
+                [[ "$L_INSTANCE" == "$physical_instance" && "$L_PHYSICAL" == "$physical_object" &&
+                   "$L_KMOD" == "$physical_kmod" && "$L_FD" == "$physical_fd" ]] ||
+                    die_f "$prefix lifetime physical DESTROY_END identity mismatch"
+                [[ "$L_FD_STATE" == CLOSED_EBADF && "$L_ERRNO" == 9 ]] ||
+                    die_f "$prefix lifetime physical DESTROY_END did not prove a closed fd"
+                ;;
+            *) die_f "$prefix unexpected lifetime record $i" ;;
+        esac
+    done <"$prefix-lifetime.txt"
+    [[ "$i" == "$expected" ]] || die_i "$prefix lifetime parser saw $i of $expected records"
+    if [[ "$mode" == ppoll-timeout ]]; then
+        app_line="$(awk 'index($0, "jm-fault-app: result=") { print NR }' "$log")"
+        last_lifetime_line="$(awk 'index($0, "panvk: jm-lifetime ") { line=NR } END { print line+0 }' "$log")"
+        [[ "$app_line" =~ ^[0-9]+$ && "$last_lifetime_line" -lt "$app_line" ]] ||
+            die_f "$prefix lifetime teardown did not precede the single app result"
+    fi
+}
+
+record_timeout_inventory() {
+    local pid="$1" ticks="$2" prefix="$3" state rc
+    read_pid
+    [[ "$PID_VALUE" == "$pid" ]] || die_i "$prefix PID vanished before timeout inventory"
+    read_ticks "$pid"
+    [[ "$START_TICKS" == "$ticks" ]] || die_i "$prefix PID generation changed before timeout inventory"
+    set +e
+    state="$(adb shell "if [ -e '$KPRCS/$pid' ]; then echo PRESENT; else echo ABSENT; fi" 2>"$prefix-kprcs-pre-stop.stderr" | tr -d '\r')"
+    rc=$?
+    set -e
+    printf 'timestamp=%s rc=%s state=%s\n' "$(stamp)" "$rc" "${state:-UNAVAILABLE}" >"$prefix-kprcs-pre-stop.txt"
+    set +e
+    adb shell "run-as $PKG sh -c 'for fd in /proc/$pid/fd/*; do echo \"\${fd##*/} \$(readlink \"\$fd\" 2>&1)\"; done'" \
+        >"$prefix-fd-pre-stop.txt" 2>"$prefix-fd-pre-stop.stderr"
+    rc=$?
+    set -e
+    printf 'timestamp=%s rc=%s\n' "$(stamp)" "$rc" >"$prefix-fd-pre-stop-status.txt"
+}
+
 verify_fault_run() {
-    local mode="$1" run="$2" prefix="$3" pid="$4" ticks="$5" deadline log armed consumed records
+    local mode="$1" run="$2" prefix="$3" pid="$4" ticks="$5" deadline log armed consumed records lifetime expected_lifetime
     log="$prefix-pid-log.txt"
+    if [[ "$mode" == ppoll-timeout ]]; then expected_lifetime=6; else expected_lifetime=2; fi
     deadline=$(( $(date +%s) + 20 ))
     while [[ $(date +%s) -le $deadline ]]; do
         need_online
@@ -183,7 +353,10 @@ verify_fault_run() {
         records="$(grep -Fc 'jm-fault-app: result=' "$log" || true)"
         armed="$(grep -Fc "panvk: jm-fault run=$run mode=$mode state=ARMED " "$log" || true)"
         consumed="$(grep -Fc "panvk: jm-fault run=$run mode=$mode state=CONSUMED " "$log" || true)"
-        [[ "$records" == 1 && "$armed" == 1 && "$consumed" == 1 ]] && break
+        lifetime="$(grep -Fc 'panvk: jm-lifetime ' "$log" || true)"
+        [[ "$records" -le 1 && "$armed" -le 1 && "$consumed" -le 1 && "$lifetime" -le "$expected_lifetime" ]] ||
+            die_i "$run emitted duplicate or extra evidence"
+        [[ "$records" == 1 && "$armed" == 1 && "$consumed" == 1 && "$lifetime" == "$expected_lifetime" ]] && break
         sleep 0.1
     done
     records="$(grep -Fc 'jm-fault-app: result=' "$log" || true)"
@@ -193,9 +366,13 @@ verify_fault_run() {
     [[ "$armed" == 1 ]] || die_i "$run has $armed matching ARMED records"
     [[ "$consumed" == 1 ]] || die_i "$run has $consumed matching CONSUMED records"
     ! grep -Eq 'panvk: jm-fault .* state=(UNCONSUMED|INJECTION_ERROR) ' "$log" || die_i "$run emitted UNCONSUMED or INJECTION_ERROR"
+    verify_lifetime_records "$mode" "$log" "$prefix" "$pid"
     grep -Fq "jm-fault-app: result=PASS run=$run mode=$mode " "$log" || die_f "$run app contract did not pass"
     grep -F "jm-fault-app: result=" "$log" >"$prefix-app-result.txt"
     grep -F "panvk: jm-fault run=$run mode=$mode state=" "$log" >"$prefix-driver-events.txt"
+    if [[ "$mode" == ppoll-timeout ]]; then
+        record_timeout_inventory "$pid" "$ticks" "$prefix"
+    fi
 }
 
 verify_recovery() {
@@ -282,7 +459,7 @@ for ((rep=1; rep<=RUNS; rep++)); do
         verify_fault_run "$mode" "$run" "$prefix" "$fault_pid" "$fault_ticks"
         fault_kprcs=PRESENT
         if [[ "$mode" == ppoll-timeout ]]; then
-            fault_kprcs=ABSENT
+            fault_kprcs=RECORD_ONLY
         fi
         force_stop_generation "$fault_pid" "$fault_ticks" "$prefix" "$fault_kprcs"
 

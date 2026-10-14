@@ -264,7 +264,9 @@ void *replaceDriver( const std::string &path, const char *hooksDir, const char *
 	else
 	{
 		__android_log_print( ANDROID_LOG_INFO, "DriverReplacer", "DRIVER REPLACEMENT LOADED" );
-		testVulkan( libVulkan );
+		const char *selector = std::getenv( "PANVK_JM_FAULT" );
+		if( !validPanvkJmFaultSelector( selector ) )
+			testVulkan( libVulkan );
 		panvk_buffer_copy_probe( libVulkan, "panvk" );
 	}
 	return libVulkan;

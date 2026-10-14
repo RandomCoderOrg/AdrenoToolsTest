@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "panvk_async_spv.h"
@@ -314,6 +315,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkEndCommandBuffer, EndCommandBuffer);
    DEVICE_PROC(PFN_vkCreateFence, CreateFence);
    DEVICE_PROC(PFN_vkDestroyFence, DestroyFence);
+   DEVICE_PROC(PFN_vkCreateSemaphore, CreateSemaphore);
+   DEVICE_PROC(PFN_vkDestroySemaphore, DestroySemaphore);
    DEVICE_PROC(PFN_vkGetFenceStatus, GetFenceStatus);
    DEVICE_PROC(PFN_vkResetFences, ResetFences);
    DEVICE_PROC(PFN_vkWaitForFences, WaitForFences);
@@ -433,7 +436,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !DestroyFramebuffer || !CmdBeginRenderPass || !CmdEndRenderPass ||
        !CmdDraw || !CmdBindIndexBuffer || !CmdDrawIndexed ||
        !CmdPushConstants || !EndCommandBuffer ||
-       !CreateFence || !DestroyFence || !GetFenceStatus || !ResetFences ||
+       !CreateFence || !DestroyFence || !CreateSemaphore ||
+       !DestroySemaphore || !GetFenceStatus || !ResetFences ||
        !WaitForFences || !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
       cleanup();
@@ -794,6 +798,7 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       VkPipeline async_pipeline{};
       VkCommandPool async_pool{};
       VkFence async_fence{};
+      VkSemaphore async_semaphore{};
       std::array<VkCommandBuffer, wave_size> commands{};
       bool submitted = false;
 
@@ -895,6 +900,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
             UnmapMemory(device, state_memory);
          if (async_fence)
             DestroyFence(device, async_fence, nullptr);
+         if (async_semaphore)
+            DestroySemaphore(device, async_semaphore, nullptr);
          if (async_pool)
             DestroyCommandPool(device, async_pool, nullptr);
          if (async_pipeline)
@@ -1076,6 +1083,12 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
                                  &async_fence);
       if (async_result != VK_SUCCESS)
          return async_failed("vkCreateFence", async_result);
+      VkSemaphoreCreateInfo async_semaphore_info{
+         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+      async_result = CreateSemaphore(device, &async_semaphore_info, nullptr,
+                                     &async_semaphore);
+      if (async_result != VK_SUCCESS)
+         return async_failed("vkCreateSemaphore", async_result);
 
       auto initialize_state = [&]() {
          auto *words = static_cast<uint32_t *>(state_map);
@@ -1278,6 +1291,79 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
       LOGI("jm-async[%s]: PASS mode=single-submit-chain command_buffers=%u "
            "terminal=%08x immediate_fences=%u",
            label, chain_size, chain_terminal, immediate_fences);
+
+      constexpr uint32_t semaphore_cycles = 64;
+      for (uint32_t cycle = 0; cycle < semaphore_cycles; ++cycle) {
+         const uint32_t terminal = 0x53454d00u + cycle + 1;
+         async_result = initialize_state();
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkFlushMappedMemoryRanges(semaphore)",
+                                async_result);
+         async_result = ResetFences(device, 1, &async_fence);
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkResetFences(semaphore)", async_result);
+         async_result = record(commands[0], 0, 0, true, false);
+         if (async_result != VK_SUCCESS)
+            return async_failed("record(semaphore-signal)", async_result);
+         async_result = record(commands[1], 1, terminal, false, true);
+         if (async_result != VK_SUCCESS)
+            return async_failed("record(semaphore-wait)", async_result);
+
+         VkSubmitInfo signal_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+         signal_submit.commandBufferCount = 1;
+         signal_submit.pCommandBuffers = &commands[0];
+         signal_submit.signalSemaphoreCount = 1;
+         signal_submit.pSignalSemaphores = &async_semaphore;
+         async_result = QueueSubmit(queue, 1, &signal_submit, VK_NULL_HANDLE);
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkQueueSubmit(semaphore-signal)", async_result);
+         submitted = true;
+
+         const VkPipelineStageFlags wait_stage =
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+         VkSubmitInfo wait_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+         wait_submit.waitSemaphoreCount = 1;
+         wait_submit.pWaitSemaphores = &async_semaphore;
+         wait_submit.pWaitDstStageMask = &wait_stage;
+         wait_submit.commandBufferCount = 1;
+         wait_submit.pCommandBuffers = &commands[1];
+         async_result = QueueSubmit(queue, 1, &wait_submit, async_fence);
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkQueueSubmit(semaphore-wait)", async_result);
+
+         if (cycle == 0) {
+            std::array<VkResult, 2> wait_results{};
+            std::thread waiters[2];
+            for (uint32_t i = 0; i < 2; ++i) {
+               waiters[i] = std::thread([&, i]() {
+                  wait_results[i] = WaitForFences(
+                     device, 1, &async_fence, VK_TRUE, fence_timeout_ns);
+               });
+            }
+            for (auto &waiter : waiters)
+               waiter.join();
+            if (wait_results[0] != VK_SUCCESS)
+               return async_failed("vkWaitForFences(concurrent-0)",
+                                   wait_results[0]);
+            if (wait_results[1] != VK_SUCCESS)
+               return async_failed("vkWaitForFences(concurrent-1)",
+                                   wait_results[1]);
+         } else if (!wait_for_batch("vkWaitForFences(semaphore)")) {
+            return false;
+         }
+         submitted = false;
+         async_result = invalidate_state();
+         if (async_result != VK_SUCCESS)
+            return async_failed("vkInvalidateMappedMemoryRanges(semaphore)",
+                                async_result);
+         if (!verify_state(2, terminal, "semaphore")) {
+            async_cleanup();
+            return false;
+         }
+      }
+      LOGI("jm-async[%s]: PASS mode=binary-semaphore "
+           "scope=same-queue-lifecycle cycles=%u concurrent_waiters=2",
+           label, semaphore_cycles);
       async_cleanup();
       const ResourceSnapshot resources_after = resource_snapshot();
       const bool resource_counting =

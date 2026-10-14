@@ -11,6 +11,9 @@
 #include <dlfcn.h>
 #include <vulkan/vulkan.h>
 #include "adrenotools/include/adrenotools/driver.h"
+#include "panvk_present.h"
+
+static void *gVulkan = nullptr;
 
 /** Copies a file from one folder into another. Dst folder must exist.
 	e.g.
@@ -151,6 +154,7 @@ void loadOriginalVulkan()
 	__android_log_print( ANDROID_LOG_INFO, "DriverReplacer",
 						 "====== START TESTING ORIGINAL VULKAN DRIVER ======" );
 	testVulkan( module );
+	panvk_buffer_copy_probe( module, "stock" );
 	__android_log_print( ANDROID_LOG_INFO, "DriverReplacer",
 						 "====== END TESTING ORIGINAL VULKAN DRIVER ======" );
 	dlclose( module );
@@ -165,7 +169,7 @@ void loadOriginalVulkan()
 @param driverName
 	Name of the driver library, e.g. "libvulkan_freedreno.so", "vulkan.msm8937.so", etc.
 */
-void replaceDriver( const std::string &path, const char *hooksDir, const char *driverName )
+void *replaceDriver( const std::string &path, const char *hooksDir, const char *driverName )
 {
 	mkdir( ( path + "temp" ).c_str(), S_IRWXU | S_IRWXG );
 
@@ -184,12 +188,15 @@ void replaceDriver( const std::string &path, const char *hooksDir, const char *d
 			__android_log_print( ANDROID_LOG_ERROR, "DriverReplacer",
 								 "Could not load vulkan library : %s!\n", dlerror() );
 		}
+		return nullptr;
 	}
 	else
 	{
 		__android_log_print( ANDROID_LOG_INFO, "DriverReplacer", "DRIVER REPLACEMENT LOADED" );
 		testVulkan( libVulkan );
+		panvk_buffer_copy_probe( libVulkan, "panvk" );
 	}
+	return libVulkan;
 }
 
 extern "C" {
@@ -245,12 +252,15 @@ void handle_cmd( android_app *pApp, int32_t cmd )
 		// "game" class if that suits your needs. Remember to change all instances of userData
 		// if you change the class here as a reinterpret_cast is dangerous this in the
 		// android_main function and the APP_CMD_TERM_WINDOW handler case.
+		if( gVulkan && pApp->window )
+			panvk_present_init( gVulkan, pApp->window );
 		break;
 	case APP_CMD_TERM_WINDOW:
 		// The window is being destroyed. Use this to clean up your userData to avoid leaking
 		// resources.
 		//
 		// We have to check if userData is assigned just in case this comes in really quickly
+		panvk_present_shutdown();
 		break;
 	default:
 		break;
@@ -283,7 +293,7 @@ void android_main( struct android_app *pApp )
 	std::string srcFolder = pApp->activity->externalDataPath ? pApp->activity->externalDataPath : "";
 	std::string dstFolder = pApp->activity->internalDataPath ? pApp->activity->internalDataPath : "";
 #ifndef USE_QUALCOMM_DRIVER
-	const char *vulkanLibName = "libvulkan_freedreno.so";
+   const char *vulkanLibName = "libvulkan_panfrost.so";
 #else
 	const char *vulkanLibName = "vulkan.ad0667.so";
 #endif
@@ -337,7 +347,7 @@ void android_main( struct android_app *pApp )
 
 	loadOriginalVulkan();
 	copyFile( srcFolder, dstFolder, vulkanLibName );
-	replaceDriver( dstFolder, nativeLibraryDir.c_str(), vulkanLibName );
+	gVulkan = replaceDriver( dstFolder, nativeLibraryDir.c_str(), vulkanLibName );
 
 	// Register an event handler for Android events
 	pApp->onAppCmd = handle_cmd;
@@ -360,6 +370,8 @@ void android_main( struct android_app *pApp )
 				pSource->process( pApp, pSource );
 			}
 		}
+		panvk_present_draw();
 	} while( !pApp->destroyRequested );
+	panvk_present_shutdown();
 }
 }

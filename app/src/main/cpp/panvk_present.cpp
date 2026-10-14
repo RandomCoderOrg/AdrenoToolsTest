@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "panvk_compute_spv.h"
+#include "panvk_draw_frag_spv.h"
+#include "panvk_draw_vert_spv.h"
 #include "panvk_sample_frag_spv.h"
 #include "panvk_sample_vert_spv.h"
 #include "panvk_triangle_frag_spv.h"
@@ -138,6 +140,17 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkRenderPass sample_render_pass{};
    VkPipeline sample_pipeline{};
    VkFramebuffer sample_framebuffer{};
+   VkImage depth_image{};
+   VkDeviceMemory depth_image_memory{};
+   VkImageView depth_image_view{};
+   VkShaderModule draw_vertex_shader{};
+   VkShaderModule draw_fragment_shader{};
+   VkPipelineLayout draw_pipeline_layout{};
+   VkRenderPass draw_render_pass{};
+   VkFramebuffer draw_framebuffer{};
+   VkPipeline indexed_pipeline{};
+   VkPipeline blend_pipeline{};
+   VkPipeline depth_pipeline{};
    void *src_map{};
    void *dst_map{};
 
@@ -287,6 +300,9 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    DEVICE_PROC(PFN_vkCmdBeginRenderPass, CmdBeginRenderPass);
    DEVICE_PROC(PFN_vkCmdEndRenderPass, CmdEndRenderPass);
    DEVICE_PROC(PFN_vkCmdDraw, CmdDraw);
+   DEVICE_PROC(PFN_vkCmdBindIndexBuffer, CmdBindIndexBuffer);
+   DEVICE_PROC(PFN_vkCmdDrawIndexed, CmdDrawIndexed);
+   DEVICE_PROC(PFN_vkCmdPushConstants, CmdPushConstants);
    DEVICE_PROC(PFN_vkCmdPipelineBarrier, CmdPipelineBarrier);
    DEVICE_PROC(PFN_vkEndCommandBuffer, EndCommandBuffer);
    DEVICE_PROC(PFN_vkQueueSubmit, QueueSubmit);
@@ -301,6 +317,28 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
          UnmapMemory(device, src_memory);
       if (dst_map && UnmapMemory)
          UnmapMemory(device, dst_memory);
+      if (draw_framebuffer && DestroyFramebuffer)
+         DestroyFramebuffer(device, draw_framebuffer, nullptr);
+      if (indexed_pipeline && DestroyPipeline)
+         DestroyPipeline(device, indexed_pipeline, nullptr);
+      if (blend_pipeline && DestroyPipeline)
+         DestroyPipeline(device, blend_pipeline, nullptr);
+      if (depth_pipeline && DestroyPipeline)
+         DestroyPipeline(device, depth_pipeline, nullptr);
+      if (draw_render_pass && DestroyRenderPass)
+         DestroyRenderPass(device, draw_render_pass, nullptr);
+      if (draw_pipeline_layout && DestroyPipelineLayout)
+         DestroyPipelineLayout(device, draw_pipeline_layout, nullptr);
+      if (draw_vertex_shader && DestroyShaderModule)
+         DestroyShaderModule(device, draw_vertex_shader, nullptr);
+      if (draw_fragment_shader && DestroyShaderModule)
+         DestroyShaderModule(device, draw_fragment_shader, nullptr);
+      if (depth_image_view && DestroyImageView)
+         DestroyImageView(device, depth_image_view, nullptr);
+      if (depth_image && DestroyImage)
+         DestroyImage(device, depth_image, nullptr);
+      if (depth_image_memory && FreeMemory)
+         FreeMemory(device, depth_image_memory, nullptr);
       if (sample_framebuffer && DestroyFramebuffer)
          DestroyFramebuffer(device, sample_framebuffer, nullptr);
       if (sample_pipeline && DestroyPipeline)
@@ -380,7 +418,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
        !CmdBindDescriptorSets || !CmdDispatch || !CmdPipelineBarrier ||
        !CreateRenderPass || !DestroyRenderPass || !CreateFramebuffer ||
        !DestroyFramebuffer || !CmdBeginRenderPass || !CmdEndRenderPass ||
-       !CmdDraw || !EndCommandBuffer ||
+       !CmdDraw || !CmdBindIndexBuffer || !CmdDrawIndexed ||
+       !CmdPushConstants || !EndCommandBuffer ||
        !QueueSubmit || !QueueWaitIdle || !DeviceWaitIdle) {
       LOGE("buffer-copy[%s]: device entrypoints unavailable", label);
       cleanup();
@@ -392,7 +431,8 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
    buffer_info.size = buffer_size;
    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-   buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+   buffer_info.usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
    result = CreateBuffer(device, &buffer_info, nullptr, &src);
    if (result != VK_SUCCESS)
       return failed("vkCreateBuffer(src)", result);
@@ -1284,6 +1324,415 @@ bool panvk_buffer_copy_probe(void *libvulkan, const char *label)
         "sourceLayer=1 hash=%016llx",
         label,
         static_cast<unsigned long long>(sample_actual_hash));
+
+   VkFormat depth_format = VK_FORMAT_UNDEFINED;
+   VkImageFormatProperties depth_properties{};
+   result = GetPhysicalDeviceImageFormatProperties(
+      physical, VK_FORMAT_D16_UNORM, VK_IMAGE_TYPE_2D,
+      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+      &depth_properties);
+   if (result != VK_SUCCESS && result != VK_ERROR_FORMAT_NOT_SUPPORTED)
+      return failed("draw D16 vkGetPhysicalDeviceImageFormatProperties",
+                    result);
+   if (result == VK_SUCCESS &&
+       depth_properties.maxExtent.width >= image_width &&
+       depth_properties.maxExtent.height >= image_height &&
+       (depth_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT)) {
+      depth_format = VK_FORMAT_D16_UNORM;
+   } else {
+      result = GetPhysicalDeviceImageFormatProperties(
+         physical, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
+         VK_IMAGE_TILING_OPTIMAL,
+         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &depth_properties);
+      if (result != VK_SUCCESS && result != VK_ERROR_FORMAT_NOT_SUPPORTED)
+         return failed("draw D32 vkGetPhysicalDeviceImageFormatProperties",
+                       result);
+      if (result == VK_SUCCESS &&
+          depth_properties.maxExtent.width >= image_width &&
+          depth_properties.maxExtent.height >= image_height &&
+          (depth_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT))
+         depth_format = VK_FORMAT_D32_SFLOAT;
+   }
+   if (depth_format == VK_FORMAT_UNDEFINED) {
+      LOGI("draw[%s]: SKIP unsupported D16/D32 depth attachment", label);
+      cleanup();
+      return false;
+   }
+
+   image_info.format = depth_format;
+   image_info.arrayLayers = 1;
+   image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+   result = CreateImage(device, &image_info, nullptr, &depth_image);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateImage(depth)", result);
+   if (!allocate_image_memory(depth_image, &depth_image_memory, "draw-depth")) {
+      cleanup();
+      return false;
+   }
+   view_info.image = depth_image;
+   view_info.format = depth_format;
+   view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+   view_info.subresourceRange.baseArrayLayer = 0;
+   view_info.subresourceRange.layerCount = 1;
+   result = CreateImageView(device, &view_info, nullptr, &depth_image_view);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateImageView(depth)", result);
+
+   shader_info.codeSize = sizeof(panvk_draw_vert_spv);
+   shader_info.pCode = panvk_draw_vert_spv;
+   result = CreateShaderModule(device, &shader_info, nullptr,
+                               &draw_vertex_shader);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateShaderModule(vertex)", result);
+   shader_info.codeSize = sizeof(panvk_draw_frag_spv);
+   shader_info.pCode = panvk_draw_frag_spv;
+   result = CreateShaderModule(device, &shader_info, nullptr,
+                               &draw_fragment_shader);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateShaderModule(fragment)", result);
+
+   VkPushConstantRange push_range{};
+   push_range.stageFlags =
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+   push_range.size = 32;
+   VkPipelineLayoutCreateInfo draw_layout_info{
+      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+   draw_layout_info.pushConstantRangeCount = 1;
+   draw_layout_info.pPushConstantRanges = &push_range;
+   result = CreatePipelineLayout(device, &draw_layout_info, nullptr,
+                                 &draw_pipeline_layout);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreatePipelineLayout", result);
+
+   VkAttachmentDescription draw_attachments[2]{};
+   draw_attachments[0].format = image_format;
+   draw_attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+   draw_attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+   draw_attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+   draw_attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   draw_attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   draw_attachments[0].initialLayout =
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   draw_attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   draw_attachments[1].format = depth_format;
+   draw_attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+   draw_attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+   draw_attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+   draw_attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+   draw_attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   draw_attachments[1].initialLayout =
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+   draw_attachments[1].finalLayout =
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+   VkAttachmentReference draw_color_reference{
+      0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+   VkAttachmentReference draw_depth_reference{
+      1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+   VkSubpassDescription draw_subpass{};
+   draw_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+   draw_subpass.colorAttachmentCount = 1;
+   draw_subpass.pColorAttachments = &draw_color_reference;
+   draw_subpass.pDepthStencilAttachment = &draw_depth_reference;
+   VkRenderPassCreateInfo draw_render_pass_info{
+      VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+   draw_render_pass_info.attachmentCount = 2;
+   draw_render_pass_info.pAttachments = draw_attachments;
+   draw_render_pass_info.subpassCount = 1;
+   draw_render_pass_info.pSubpasses = &draw_subpass;
+   result = CreateRenderPass(device, &draw_render_pass_info, nullptr,
+                             &draw_render_pass);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateRenderPass", result);
+   VkImageView draw_views[2] = {output_image_view, depth_image_view};
+   framebuffer_info.renderPass = draw_render_pass;
+   framebuffer_info.attachmentCount = 2;
+   framebuffer_info.pAttachments = draw_views;
+   result = CreateFramebuffer(device, &framebuffer_info, nullptr,
+                              &draw_framebuffer);
+   if (result != VK_SUCCESS)
+      return failed("draw vkCreateFramebuffer", result);
+
+   VkPipelineShaderStageCreateInfo draw_stages[2] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_VERTEX_BIT, draw_vertex_shader, "main", nullptr},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+       VK_SHADER_STAGE_FRAGMENT_BIT, draw_fragment_shader, "main", nullptr},
+   };
+   VkPipelineDepthStencilStateCreateInfo depth_state{
+      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+   depth_state.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+   VkPipelineColorBlendAttachmentState draw_blend_attachment{};
+   draw_blend_attachment.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+   VkPipelineColorBlendStateCreateInfo draw_blend{
+      VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+   draw_blend.attachmentCount = 1;
+   draw_blend.pAttachments = &draw_blend_attachment;
+   graphics_info.pStages = draw_stages;
+   graphics_info.pDepthStencilState = &depth_state;
+   graphics_info.pColorBlendState = &draw_blend;
+   graphics_info.layout = draw_pipeline_layout;
+   graphics_info.renderPass = draw_render_pass;
+   rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
+   result = CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &graphics_info,
+                                    nullptr, &indexed_pipeline);
+   if (result != VK_SUCCESS)
+      return failed("indexed vkCreateGraphicsPipelines", result);
+
+   draw_blend_attachment.blendEnable = VK_TRUE;
+   rasterization.cullMode = VK_CULL_MODE_NONE;
+   draw_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+   draw_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+   draw_blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+   draw_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+   draw_blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+   draw_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+   result = CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &graphics_info,
+                                    nullptr, &blend_pipeline);
+   if (result != VK_SUCCESS)
+      return failed("blend vkCreateGraphicsPipelines", result);
+
+   draw_blend_attachment.blendEnable = VK_FALSE;
+   depth_state.depthTestEnable = VK_TRUE;
+   depth_state.depthWriteEnable = VK_TRUE;
+   depth_state.depthCompareOp = VK_COMPARE_OP_LESS;
+   result = CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &graphics_info,
+                                    nullptr, &depth_pipeline);
+   if (result != VK_SUCCESS)
+      return failed("depth vkCreateGraphicsPipelines", result);
+
+   constexpr VkDeviceSize index_offset = image_buffer_size;
+   const uint16_t indices[3] = {0, 2, 1};
+   std::memcpy(static_cast<uint8_t *>(src_map) + index_offset, indices,
+               sizeof(indices));
+   if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+      range.memory = src_memory;
+      range.size = VK_WHOLE_SIZE;
+      result = FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS)
+         return failed("indexed vkFlushMappedMemoryRanges", result);
+   }
+
+   struct DrawPush {
+      float color[4];
+      float params[4];
+   };
+   static_assert(sizeof(DrawPush) == 32, "unexpected draw push size");
+   auto run_draw_probe = [&](const char *probe, VkPipeline pipeline,
+                             uint8_t sentinel,
+                             const std::array<uint8_t, 4> &expected_pixel,
+                             uint32_t mode) {
+      std::array<uint8_t, image_buffer_size> draw_expected{};
+      draw_expected.fill(sentinel);
+      for (uint32_t y = 0; y < image_height; ++y) {
+         for (uint32_t x = 0; x < image_width; ++x) {
+            const size_t offset = y * row_pitch + x * 4;
+            std::memcpy(draw_expected.data() + offset, expected_pixel.data(),
+                        expected_pixel.size());
+         }
+      }
+      std::memset(dst_map, sentinel, image_buffer_size);
+      if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = dst_memory;
+         range.size = VK_WHOLE_SIZE;
+         VkResult flush_result = FlushMappedMemoryRanges(device, 1, &range);
+         if (flush_result != VK_SUCCESS) {
+            LOGE("%s[%s]: vkFlushMappedMemoryRanges failed: %d", probe, label,
+                 flush_result);
+            return false;
+         }
+      }
+
+      VkCommandBuffer draw_command{};
+      VkResult draw_result =
+         AllocateCommandBuffers(device, &command_info, &draw_command);
+      if (draw_result != VK_SUCCESS) {
+         LOGE("%s[%s]: vkAllocateCommandBuffers failed: %d", probe, label,
+              draw_result);
+         return false;
+      }
+      draw_result = BeginCommandBuffer(draw_command, &begin_info);
+      if (draw_result != VK_SUCCESS) {
+         LOGE("%s[%s]: vkBeginCommandBuffer failed: %d", probe, label,
+              draw_result);
+         return false;
+      }
+      VkImageMemoryBarrier draw_color_barrier{
+         VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      draw_color_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      draw_color_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      draw_color_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      draw_color_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      draw_color_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      draw_color_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      draw_color_barrier.image = output_image;
+      draw_color_barrier.subresourceRange =
+         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      CmdPipelineBarrier(draw_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &draw_color_barrier);
+      if (mode == 0) {
+         VkImageMemoryBarrier depth_barrier{
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+         depth_barrier.dstAccessMask =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+         depth_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+         depth_barrier.newLayout =
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+         depth_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         depth_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         depth_barrier.image = depth_image;
+         depth_barrier.subresourceRange =
+            {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+         CmdPipelineBarrier(draw_command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0,
+                            nullptr, 0, nullptr, 1, &depth_barrier);
+         VkBufferMemoryBarrier index_barrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+         index_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+         index_barrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+         index_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         index_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+         index_barrier.buffer = src;
+         index_barrier.offset = index_offset;
+         index_barrier.size = sizeof(indices);
+         CmdPipelineBarrier(draw_command, VK_PIPELINE_STAGE_HOST_BIT,
+                            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, nullptr,
+                            1, &index_barrier, 0, nullptr);
+      }
+
+      VkClearValue clears[2]{};
+      if (mode == 1)
+         clears[0].color.float32[0] = 1.0f;
+      clears[1].depthStencil.depth = 1.0f;
+      VkRenderPassBeginInfo draw_begin{
+         VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      draw_begin.renderPass = draw_render_pass;
+      draw_begin.framebuffer = draw_framebuffer;
+      draw_begin.renderArea = scissor;
+      draw_begin.clearValueCount = 2;
+      draw_begin.pClearValues = clears;
+      CmdBeginRenderPass(draw_command, &draw_begin, VK_SUBPASS_CONTENTS_INLINE);
+      CmdBindPipeline(draw_command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      DrawPush push{};
+      if (mode == 0) {
+         push.color[2] = push.color[3] = 1.0f;
+         push.params[0] = 0.5f;
+         CmdPushConstants(draw_command, draw_pipeline_layout,
+                          VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(push), &push);
+         CmdBindIndexBuffer(draw_command, src, index_offset,
+                            VK_INDEX_TYPE_UINT16);
+         CmdDrawIndexed(draw_command, 3, 1, 0, 0, 0);
+      } else if (mode == 1) {
+         push.color[1] = push.color[3] = 1.0f;
+         push.params[0] = 0.5f;
+         CmdPushConstants(draw_command, draw_pipeline_layout,
+                          VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(push), &push);
+         CmdDraw(draw_command, 3, 1, 0, 0);
+      } else {
+         push.color[1] = push.color[3] = 1.0f;
+         push.params[0] = 0.25f;
+         CmdPushConstants(draw_command, draw_pipeline_layout,
+                          VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(push), &push);
+         CmdDraw(draw_command, 3, 1, 0, 0);
+         std::memset(&push, 0, sizeof(push));
+         push.color[0] = push.color[3] = 1.0f;
+         push.params[0] = 0.75f;
+         CmdPushConstants(draw_command, draw_pipeline_layout,
+                          VK_SHADER_STAGE_VERTEX_BIT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(push), &push);
+         CmdDraw(draw_command, 3, 1, 0, 0);
+      }
+      CmdEndRenderPass(draw_command);
+      draw_color_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      draw_color_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      draw_color_barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      draw_color_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      CmdPipelineBarrier(draw_command,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &draw_color_barrier);
+      CmdCopyImageToBuffer(draw_command, output_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, 1,
+                           &sample_copy);
+      CmdPipelineBarrier(draw_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                         &transfer_host_barrier, 0, nullptr);
+      draw_result = EndCommandBuffer(draw_command);
+      if (draw_result != VK_SUCCESS) {
+         LOGE("%s[%s]: vkEndCommandBuffer failed: %d", probe, label,
+              draw_result);
+         return false;
+      }
+      VkSubmitInfo draw_submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      draw_submit.commandBufferCount = 1;
+      draw_submit.pCommandBuffers = &draw_command;
+      draw_result = QueueSubmit(queue, 1, &draw_submit, VK_NULL_HANDLE);
+      if (draw_result == VK_SUCCESS)
+         draw_result = QueueWaitIdle(queue);
+      if (draw_result != VK_SUCCESS) {
+         LOGE("%s[%s]: submit/wait failed: %d", probe, label, draw_result);
+         return false;
+      }
+      if (!(memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+         range.memory = dst_memory;
+         range.size = VK_WHOLE_SIZE;
+         draw_result = InvalidateMappedMemoryRanges(device, 1, &range);
+         if (draw_result != VK_SUCCESS) {
+            LOGE("%s[%s]: vkInvalidateMappedMemoryRanges failed: %d", probe,
+                 label, draw_result);
+            return false;
+         }
+      }
+      uint64_t expected_hash = 1469598103934665603ull;
+      uint64_t actual_hash = 1469598103934665603ull;
+      for (VkDeviceSize i = 0; i < image_buffer_size; ++i) {
+         expected_hash =
+            (expected_hash ^ draw_expected[i]) * 1099511628211ull;
+         actual_hash =
+            (actual_hash ^ actual_bytes[i]) * 1099511628211ull;
+      }
+      if (std::memcmp(draw_expected.data(), dst_map, image_buffer_size) != 0) {
+         VkDeviceSize first = 0;
+         while (first < image_buffer_size &&
+                draw_expected[first] == actual_bytes[first])
+            ++first;
+         LOGE("%s[%s]: FAIL byte=%llu expected=%02x actual=%02x "
+              "expected_hash=%016llx actual_hash=%016llx",
+              probe, label, static_cast<unsigned long long>(first),
+              draw_expected[first], actual_bytes[first],
+              static_cast<unsigned long long>(expected_hash),
+              static_cast<unsigned long long>(actual_hash));
+         return false;
+      }
+      LOGI("%s[%s]: PASS extent=31x29 rowLength=32 imageHeight=30 "
+           "hash=%016llx",
+           probe, label, static_cast<unsigned long long>(actual_hash));
+      return true;
+   };
+
+   if (!run_draw_probe("indexed", indexed_pipeline, 0x27,
+                       {0, 0, 255, 255}, 0) ||
+       !run_draw_probe("blend", blend_pipeline, 0x39,
+                       {255, 255, 0, 255}, 1) ||
+       !run_draw_probe("depth", depth_pipeline, 0x4b,
+                       {0, 255, 0, 255}, 2)) {
+      cleanup();
+      return false;
+   }
    cleanup();
    return true;
 }

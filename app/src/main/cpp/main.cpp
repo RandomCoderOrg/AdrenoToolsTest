@@ -39,7 +39,7 @@ static bool validPanvkJmFaultSelector( const char *selector )
 	const size_t modeLength = countSeparator ? static_cast<size_t>( countSeparator - modeSeparator - 1 )
 										 : std::strlen( modeSeparator + 1 );
 	static const char *modes[] = { "submit-eio", "ppoll-eio", "ppoll-timeout", "read-eio",
-								 "done-failure" };
+								 "done-failure", "hold-after-submit" };
 	bool validMode = false;
 	for( const char *mode : modes )
 	{

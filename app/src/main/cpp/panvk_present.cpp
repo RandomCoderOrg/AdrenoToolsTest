@@ -195,7 +195,7 @@ JmFaultSelector read_jm_fault_selector(const char *label)
                       : std::strlen(mode_separator + 1);
    static constexpr const char *modes[] = {
       "submit-eio", "ppoll-eio", "ppoll-timeout", "read-eio",
-      "done-failure",
+      "done-failure", "hold-after-submit",
    };
    const char *matched_mode = nullptr;
    for (const char *mode : modes) {

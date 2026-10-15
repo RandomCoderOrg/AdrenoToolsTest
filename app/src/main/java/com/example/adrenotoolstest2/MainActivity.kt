@@ -18,7 +18,7 @@ import kotlin.math.roundToInt
 class MainActivity : GameActivity() {
     companion object {
         private val PANVK_JM_FAULT_PATTERN =
-            Regex("^[A-Za-z0-9._-]+:(submit-eio|ppoll-eio|ppoll-timeout|read-eio|done-failure)(:[1-9][0-9]*)?$")
+            Regex("^[A-Za-z0-9._-]+:(submit-eio|ppoll-eio|ppoll-timeout|read-eio|done-failure|hold-after-submit)(:[1-9][0-9]*)?$")
 
         init {
             System.loadLibrary("adrenotoolstest2")
